@@ -14,8 +14,8 @@ import { AdminStats, AppointmentItem, HandoffItem } from '../types';
 
 export const AdminDashboard: React.FC = () => {
   const [token, setToken] = useState<string | null>(() => localStorage.getItem('voicedesk_admin_token'));
-  const [username, setUsername] = useState('admin');
-  const [password, setPassword] = useState('CareBridge2026!');
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
   const [loginError, setLoginError] = useState<string | null>(null);
   const [isLoggingIn, setIsLoggingIn] = useState(false);
 
@@ -160,8 +160,8 @@ export const AdminDashboard: React.FC = () => {
           </button>
         </form>
 
-        <div className="text-[11px] text-slate-500 text-center bg-navy-950/60 p-3 rounded-xl border border-navy-850">
-          Portfolio Demo Credentials: <strong className="text-slate-300 font-mono">admin</strong> / <strong className="text-slate-300 font-mono">CareBridge2026!</strong>
+        <div className="text-[11px] text-slate-400 text-center bg-navy-950/60 p-3 rounded-xl border border-navy-850">
+          🔒 Protected Access: Authorized CareBridge Clinic administrative personnel only.
         </div>
       </div>
     );
