@@ -64,7 +64,7 @@ export async function fetchVoiceStatus() {
 }
 
 export async function resetDemoData() {
-  const res = await fetch(`${API_BASE}/system/reset-demo`, { method: 'POST' });
+  const res = await fetch(`${API_BASE}/system/reset-demo`, { method: 'POST', headers: { Authorization: `Bearer ${localStorage.getItem('voicedesk_admin_token') || ''}` } });
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: 'Reset failed' }));
     throw new Error(err.detail || 'Reset failed');

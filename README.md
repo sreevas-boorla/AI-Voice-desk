@@ -1,6 +1,36 @@
+# Run the verified browser demo
+
+The supported voice path uses browser SpeechRecognition and SpeechSynthesis. LiveKit's worker is scaffolding and is not connected; no API reports it as active. Text chat works without microphone access. Use Chrome on localhost or HTTPS for browser voice; browser support varies.
+
+From the repository root (Windows PowerShell), run in terminal 1:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python -m pip install -r backend/requirements.txt
+cd backend
+..\.venv\Scripts\python -m app.seed
+..\.venv\Scripts\python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+```
+
+In terminal 2:
+
+```powershell
+cd frontend
+npm ci
+npm run dev -- --host 127.0.0.1
+```
+
+Open http://localhost:5180. The frontend proxies `/api` to port 8000.
+
+Default DEMO_MODE=true uses a deterministic simulator and real local database tools. For real LLM responses create `backend/.env` with `DEMO_MODE=false` and `GROQ_API_KEY` set locally, then restart the backend. Only Groq is implemented. Never commit this file. Live mode uses confirmation cards for mutations. No live provider call has been validated without credentials.
+
+## Original project documentation (historical design)
+
+The LiveKit and production-readiness claims below describe intended scope, not verified capabilities.
+
 # VoiceDesk — Agentic AI Receptionist for CareBridge Clinic
 
-VoiceDesk is a production-grade, agentic AI receptionist built for **CareBridge Clinic**, a fictional multi-specialty healthcare practice in Jubilee Hills, Hyderabad, India. Operating in the `Asia/Kolkata` (IST, UTC+5:30) timezone, VoiceDesk handles clinic inquiries, checks provider availability, books appointments, verifies patient identity, reschedules/cancels visits with explicit two-phase confirmation, and escalates unresolved matters to human receptionists.
+VoiceDesk is a portfolio prototype of an agentic AI receptionist built for **CareBridge Clinic**, a fictional multi-specialty healthcare practice in Jubilee Hills, Hyderabad, India. Operating in the `Asia/Kolkata` (IST, UTC+5:30) timezone, VoiceDesk handles clinic inquiries, checks provider availability, books appointments, verifies patient identity, reschedules/cancels visits with explicit two-phase confirmation, and escalates unresolved matters to human receptionists.
 
 ---
 

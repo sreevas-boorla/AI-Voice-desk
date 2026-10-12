@@ -4,6 +4,7 @@ from app.database import get_db, Base, engine
 from app.config import settings
 from app.models import Provider, Service
 from app.seed import seed_database
+from app.auth import get_current_admin
 
 router = APIRouter(prefix="/api/system", tags=["System"])
 
@@ -57,7 +58,7 @@ def get_clinic_info(db: Session = Depends(get_db)):
 def get_system_status():
     """Provides provider connection and health indicators without exposing secrets."""
     has_livekit = bool(settings.LIVEKIT_URL and settings.LIVEKIT_API_KEY and settings.LIVEKIT_API_SECRET)
-    has_llm = bool(settings.GEMINI_API_KEY or settings.GROQ_API_KEY or settings.OPENAI_API_KEY)
+    has_llm = bool(settings.GROQ_API_KEY)
 
     return {
         "database": {
@@ -65,13 +66,13 @@ def get_system_status():
             "type": "PostgreSQL" if "postgres" in settings.DATABASE_URL else "SQLite (Local Concurrency Protected)"
         },
         "voice_provider": {
-            "configured": has_livekit,
-            "provider": "LiveKit WebRTC Cloud" if has_livekit else "Web Speech API (Browser Simulation)",
-            "mode": "live" if (has_livekit and not settings.DEMO_MODE) else "demo"
+            "configured": True,
+            "provider": "Browser SpeechRecognition / SpeechSynthesis",
+            "mode": "browser"
         },
         "llm_provider": {
             "configured": has_llm,
-            "provider": "Groq LLaMA 3.3 / Gemini" if has_llm else "VoiceDesk Deterministic Simulator",
+            "provider": "Groq" if has_llm else "VoiceDesk Deterministic Simulator",
             "mode": "live" if (has_llm and not settings.DEMO_MODE) else "demo"
         },
         "environment": settings.ENVIRONMENT,
@@ -79,9 +80,9 @@ def get_system_status():
     }
 
 @router.post("/reset-demo")
-def reset_demo_data(db: Session = Depends(get_db)):
+def reset_demo_data(db: Session = Depends(get_db), admin=Depends(get_current_admin)):
     """Restores synthetic seed data. Strictly forbidden in production."""
-    if settings.ENVIRONMENT == "production" and not settings.DEMO_MODE:
+    if settings.ENVIRONMENT == "production" or not settings.DEMO_MODE:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Demo reset is disabled in production environments."

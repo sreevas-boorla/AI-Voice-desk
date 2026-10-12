@@ -18,7 +18,7 @@ interface ReceptionistPageProps {
 export const ReceptionistPage: React.FC<ReceptionistPageProps> = ({ isDemoMode }) => {
   const [mode, setMode] = useState<'text' | 'voice'>('voice');
   const [sessionToken, setSessionToken] = useState<string>(() => {
-    return 'sess_' + Math.random().toString(36).substring(2, 10);
+    return 'sess_' + crypto.randomUUID();
   });
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [inputValue, setInputValue] = useState('');
@@ -35,6 +35,16 @@ export const ReceptionistPage: React.FC<ReceptionistPageProps> = ({ isDemoMode }
   const transcriptEndRef = useRef<HTMLDivElement>(null);
   const recognitionRef = useRef<any>(null);
   const synthRef = useRef<SpeechSynthesis | null>(typeof window !== 'undefined' ? window.speechSynthesis : null);
+
+  const voiceActiveRef = useRef(false);
+  const mutedRef = useRef(false);
+  const busyRef = useRef(false);
+  const submitRef = useRef<(text: string) => Promise<void>>(async () => {});
+  useEffect(() => () => {
+    voiceActiveRef.current = false;
+    recognitionRef.current?.abort();
+    synthRef.current?.cancel();
+  }, []);
 
   // Auto-scroll transcript
   useEffect(() => {
@@ -80,7 +90,7 @@ export const ReceptionistPage: React.FC<ReceptionistPageProps> = ({ isDemoMode }
         const lastIndex = event.results.length - 1;
         const transcript = event.results[lastIndex][0].transcript.trim();
         if (transcript) {
-          handleUserSubmission(transcript);
+          void submitRef.current(transcript);
         }
       };
 
@@ -88,7 +98,8 @@ export const ReceptionistPage: React.FC<ReceptionistPageProps> = ({ isDemoMode }
         if (event.error === 'not-allowed') {
           setVoiceError('Microphone permission was denied. Please allow microphone access or use text mode.');
           setVoiceState('error');
-          setIsVoiceActive(false);
+          voiceActiveRef.current = false;
+    setIsVoiceActive(false);
         } else if (event.error !== 'no-speech') {
           setVoiceError(`Audio input error: ${event.error}`);
           setVoiceState('error');
@@ -96,7 +107,7 @@ export const ReceptionistPage: React.FC<ReceptionistPageProps> = ({ isDemoMode }
       };
 
       recognition.onend = () => {
-        if (isVoiceActive && !isMuted) {
+        if (voiceActiveRef.current && !mutedRef.current) {
           try {
             recognition.start();
           } catch (_) {}
@@ -150,6 +161,7 @@ export const ReceptionistPage: React.FC<ReceptionistPageProps> = ({ isDemoMode }
 
   const startVoiceConversation = () => {
     setVoiceError(null);
+    voiceActiveRef.current = true;
     setIsVoiceActive(true);
     setVoiceState('listening');
 
@@ -164,6 +176,7 @@ export const ReceptionistPage: React.FC<ReceptionistPageProps> = ({ isDemoMode }
   };
 
   const endVoiceConversation = () => {
+    voiceActiveRef.current = false;
     setIsVoiceActive(false);
     setVoiceState('idle');
     if (recognitionRef.current) {
@@ -178,12 +191,14 @@ export const ReceptionistPage: React.FC<ReceptionistPageProps> = ({ isDemoMode }
 
   const toggleMute = () => {
     if (isMuted) {
+      mutedRef.current = false;
       setIsMuted(false);
       if (isVoiceActive && recognitionRef.current) {
         try { recognitionRef.current.start(); } catch (_) {}
       }
       setVoiceState(isVoiceActive ? 'listening' : 'idle');
     } else {
+      mutedRef.current = true;
       setIsMuted(true);
       if (recognitionRef.current) {
         try { recognitionRef.current.stop(); } catch (_) {}
@@ -197,7 +212,8 @@ export const ReceptionistPage: React.FC<ReceptionistPageProps> = ({ isDemoMode }
 
   // Core submission handler for both voice transcripts and typed messages
   const handleUserSubmission = async (textToSend: string) => {
-    if (!textToSend.trim() || isLoading) return;
+    if (!textToSend.trim() || busyRef.current) return;
+    busyRef.current = true;
 
     // If currently speaking, stop immediately to allow user interruption
     if (synthRef.current) {
@@ -266,9 +282,12 @@ export const ReceptionistPage: React.FC<ReceptionistPageProps> = ({ isDemoMode }
       setMessages((prev) => [...prev, errorResponse]);
       setVoiceState('idle');
     } finally {
+      busyRef.current = false;
       setIsLoading(false);
     }
   };
+
+  submitRef.current = handleUserSubmission;
 
   // Execute explicit action confirmation
   const handleConfirmAction = async (actionId: string, confirmed: boolean) => {
@@ -305,7 +324,7 @@ export const ReceptionistPage: React.FC<ReceptionistPageProps> = ({ isDemoMode }
     <div className="max-w-7xl mx-auto px-4 lg:px-8 py-8 space-y-6">
       
       {/* Top Banner & Quick Reference Panel */}
-      <DemoReferencePanel onSelectPrompt={handleUserSubmission} />
+      {isDemoMode && <DemoReferencePanel onSelectPrompt={handleUserSubmission} />}
 
       {/* Main Grid: Left Control & Voice Engine | Right Interactive Transcript */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
