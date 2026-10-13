@@ -605,8 +605,22 @@ export const ReceptionistPage: React.FC<ReceptionistPageProps> = ({ isDemoMode }
       };
       setMessages((prev) => [...prev, statusMsg]);
 
-      if (mode === 'voice' && isVoiceActive && !isMuted && voiceEngine === 'browser') {
-        speakText(res.message);
+      if (mode === 'voice' && isVoiceActive && !isMuted) {
+        if (voiceEngine === 'browser') {
+          speakText(res.message);
+        } else if (voiceEngine === 'livekit' && roomRef.current && roomRef.current.state === 'connected') {
+          try {
+            const payload = JSON.stringify({
+              type: 'confirmation_result',
+              action_id: actionId,
+              message: res.message
+            });
+            const encoder = new TextEncoder();
+            await roomRef.current.localParticipant.publishData(encoder.encode(payload), { reliable: true });
+          } catch (pubErr) {
+            console.warn('Failed to deliver confirmation result to LiveKit room:', pubErr);
+          }
+        }
       }
     } catch (e: any) {
       const errMessage: ChatMessage = {

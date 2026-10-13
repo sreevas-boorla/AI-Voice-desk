@@ -9,11 +9,16 @@ Compatible with LiveKit Agents SDK 1.8.6+.
 import os
 import sys
 import json
+import time
 import asyncio
 import logging
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Set
 from dotenv import load_dotenv
 import httpx
+
+# Add voice-worker directory to sys.path so TurnQueueManager can be imported directly
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from turn_manager import TurnQueueManager
 
 load_dotenv()
 
@@ -40,9 +45,9 @@ def check_credentials() -> Dict[str, bool]:
 async def call_backend_agent(session_token: str, message: str) -> Dict[str, Any]:
     """
     Reuses the backend's core booking, verification, and confirmation rules.
-    Ensures one user utterance produces exactly one agent response,
-    avoiding duplicate or diverging state between worker and server.
+    Ensures one user utterance produces exactly one agent response.
     """
+    correlation_id = session_token[:8] if session_token else "unknown"
     async with httpx.AsyncClient(timeout=30.0) as client:
         try:
             res = await client.post(
@@ -54,11 +59,11 @@ async def call_backend_agent(session_token: str, message: str) -> Dict[str, Any]
                 }
             )
             if res.status_code != 200:
-                logger.error(f"Backend agent returned HTTP {res.status_code}")
+                logger.error(f"[{correlation_id}] Backend agent error HTTP {res.status_code}")
                 return {"reply": "I'm having trouble connecting to CareBridge Clinic server. Please try again."}
             return res.json()
         except Exception as e:
-            logger.error(f"Error calling backend agent: {e}")
+            logger.error(f"[{correlation_id}] Connection error calling backend agent: {type(e).__name__}")
             return {"reply": "The clinic appointment system is temporarily unreachable. Please try again."}
 
 def run_worker():
@@ -75,6 +80,7 @@ def run_worker():
         return
 
     try:
+        import livekit.rtc as rtc
         from livekit.agents import JobContext, WorkerOptions, cli
         from livekit.agents.voice import Agent, AgentSession, UserInputTranscribedEvent
         from livekit.plugins import deepgram, cartesia, silero
@@ -84,16 +90,17 @@ def run_worker():
         async def entrypoint(ctx: JobContext):
             room_name = ctx.room.name
             session_token = room_name.replace("room_", "") if "room_" in room_name else room_name
-            logger.info(f"Connecting to LiveKit room: {room_name} (Session: {session_token})")
+            correlation_id = session_token[:8] if session_token else "anon"
+            logger.info(f"[{correlation_id}] Connecting to LiveKit room: {room_name}")
 
             await ctx.connect()
 
             # Wait for patient participant to join
             participant = await ctx.wait_for_participant()
-            logger.info(f"Participant joined room: {participant.identity}")
+            logger.info(f"[{correlation_id}] Participant joined room: identity={participant.identity[:12]}...")
 
             if not status["deepgram_stt"] or not status["cartesia_tts"]:
-                logger.error("DEEPGRAM_API_KEY or CARTESIA_API_KEY missing. Audio pipeline cannot stream.")
+                logger.error(f"[{correlation_id}] DEEPGRAM_API_KEY or CARTESIA_API_KEY missing. Audio pipeline cannot stream.")
                 await ctx.room.local_participant.publish_data(
                     json.dumps({
                         "type": "error",
@@ -122,68 +129,83 @@ def run_worker():
                 allow_interruptions=True
             )
 
-            # Sequential FIFO turn queue to prevent overlapping requests or out-of-order execution
-            turn_queue: asyncio.Queue[str] = asyncio.Queue()
-            last_processed = {"text": "", "time": 0.0}
+            # TurnQueueManager handles FIFO sequencing, deduplication, and safe shutdown
+            turn_mgr = TurnQueueManager(deduplication_window_seconds=2.0)
+            spoken_actions: Set[str] = set()
 
-            async def process_turns_sequentially():
-                while True:
-                    try:
-                        user_text = await turn_queue.get()
-                        await handle_user_turn(session, ctx.room, session_token, user_text)
-                    except asyncio.CancelledError:
-                        break
-                    except Exception as e:
-                        logger.error(f"Error handling turn in session {session_token}: {e}")
-                    finally:
-                        turn_queue.task_done()
+            async def handle_user_turn(user_text: str):
+                t0 = time.time()
+                logger.info(f"[{correlation_id}] Dispatching turn to backend agent (chars={len(user_text)})")
 
-            # Start background worker task for sequential turns
-            worker_task = asyncio.create_task(process_turns_sequentially())
-            ctx.add_shutdown_callback(lambda: worker_task.cancel())
+                resp = await call_backend_agent(session_token, user_text)
+                reply_text = resp.get("reply", "I am standing by.")
+                tool_events = resp.get("tool_events", [])
+                pending_action = resp.get("pending_action")
+                duration = time.time() - t0
 
+                logger.info(
+                    f"[{correlation_id}] Backend turn completed in {duration:.2f}s "
+                    f"(tools={len(tool_events)}, pending_action={bool(pending_action)})"
+                )
+
+                # Publish structured event to room data channel
+                try:
+                    packet = json.dumps({
+                        "type": "agent_response",
+                        "user_text": user_text,
+                        "reply": reply_text,
+                        "tool_events": tool_events,
+                        "pending_action": pending_action
+                    })
+                    await ctx.room.local_participant.publish_data(packet, reliable=True)
+                except Exception as pe:
+                    logger.warning(f"[{correlation_id}] Failed to publish room data packet: {type(pe).__name__}")
+
+                # Synthesize voice response back to the room audio track
+                logger.info(f"[{correlation_id}] Streaming synthesized agent response via TTS (chars={len(reply_text)})")
+                await session.say(reply_text, allow_interruptions=True)
+
+            # Start sequential consumer task
+            consumer_task = turn_mgr.start_consumer(handle_user_turn)
+
+            # Register async shutdown callback to cleanly cancel and await consumer task
+            async def on_shutdown():
+                logger.info(f"[{correlation_id}] Room shutting down; draining turn consumer task.")
+                await turn_mgr.shutdown()
+
+            ctx.add_shutdown_callback(on_shutdown)
+
+            # Listen for transcribed user turns
             @session.on("user_input_transcribed")
             def on_user_speech(event: UserInputTranscribedEvent):
                 if not event.is_final or not event.transcript.strip():
                     return
                 user_text = event.transcript.strip()
-                now = asyncio.get_event_loop().time()
+                enqueued = turn_mgr.enqueue(user_text)
+                if enqueued:
+                    logger.info(f"[{correlation_id}] Final user speech committed & enqueued (chars={len(user_text)})")
+                else:
+                    logger.info(f"[{correlation_id}] Rapid duplicate transcript filtered")
 
-                # Deduplicate rapid repeat of exact transcript within 2.0s
-                if user_text.lower() == last_processed["text"].lower() and (now - last_processed["time"]) < 2.0:
-                    logger.info(f"Duplicate transcript discarded in session {session_token}: '{user_text}'")
-                    return
-                last_processed["text"] = user_text
-                last_processed["time"] = now
-
-                logger.info(f"User utterance queued in session {session_token}: '{user_text}'")
-                turn_queue.put_nowait(user_text)
+            # Listen for data messages from client (e.g. authoritative confirmation results to speak)
+            @ctx.room.on("data_received")
+            def on_data_received(packet: rtc.DataPacket):
+                try:
+                    raw_text = packet.data.decode("utf-8")
+                    data = json.loads(raw_text)
+                    if data.get("type") == "confirmation_result":
+                        action_id = data.get("action_id")
+                        msg = data.get("message")
+                        # Speak authoritative result once; preserve session isolation & idempotency
+                        if action_id and msg and action_id not in spoken_actions:
+                            spoken_actions.add(action_id)
+                            logger.info(f"[{correlation_id}] Speaking authoritative confirmation result (action={action_id[:8]}...)")
+                            asyncio.create_task(session.say(msg, allow_interruptions=True))
+                except Exception as de:
+                    logger.warning(f"[{correlation_id}] Error handling room data packet: {type(de).__name__}")
 
             await session.start(agent=agent, room=ctx.room)
-            logger.info(f"LiveKit AgentSession active in room {room_name}.")
-
-        async def handle_user_turn(session, room, session_token: str, user_text: str):
-            # Call backend REST agent (single source of truth for all tools and bookings)
-            resp = await call_backend_agent(session_token, user_text)
-            reply_text = resp.get("reply", "I am standing by.")
-            tool_events = resp.get("tool_events", [])
-            pending_action = resp.get("pending_action")
-
-            # Publish structured event to room data channel so frontend UI updates transcripts, tool logs, & confirmation cards
-            try:
-                packet = json.dumps({
-                    "type": "agent_response",
-                    "user_text": user_text,
-                    "reply": reply_text,
-                    "tool_events": tool_events,
-                    "pending_action": pending_action
-                })
-                await room.local_participant.publish_data(packet, reliable=True)
-            except Exception as pe:
-                logger.warning(f"Could not publish room data packet: {pe}")
-
-            # Synthesize voice response back to the room audio track
-            await session.say(reply_text, allow_interruptions=True)
+            logger.info(f"[{correlation_id}] LiveKit AgentSession active in room {room_name}.")
 
         options = WorkerOptions(entrypoint_fnc=entrypoint)
         # Default to "start" command if invoked without explicit CLI subcommand

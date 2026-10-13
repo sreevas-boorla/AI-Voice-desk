@@ -1,79 +1,187 @@
+import sys
 import asyncio
-import pytest
+from pathlib import Path
 
-def test_worker_turn_queue_processes_sequentially():
+# Add voice-worker directory to sys.path so TurnQueueManager can be imported directly
+voice_worker_path = Path(__file__).resolve().parents[2] / "voice-worker"
+if str(voice_worker_path) not in sys.path:
+    sys.path.insert(0, str(voice_worker_path))
+
+from turn_manager import TurnQueueManager
+
+
+def test_turn_queue_fifo_and_single_inflight():
     """
-    Verifies that the LiveKit worker FIFO queue processes turns sequentially,
-    preventing overlapping backend calls and maintaining execution order.
+    Verifies that TurnQueueManager processes turns in strict FIFO order
+    and ensures exactly one turn is in flight at a time.
     """
-    async def run_scenario():
-        turn_queue: asyncio.Queue[str] = asyncio.Queue()
+    async def scenario():
+        turn_mgr = TurnQueueManager()
         processed_order = []
         in_flight = 0
         max_concurrent = 0
 
-        async def mock_handle_turn(text: str):
+        async def mock_handler(text: str):
             nonlocal in_flight, max_concurrent
             in_flight += 1
             if in_flight > max_concurrent:
                 max_concurrent = in_flight
-            # Simulate variable network latency
-            await asyncio.sleep(0.05 if text == "First" else 0.01)
+            # Simulate latency where earlier item takes longer
+            await asyncio.sleep(0.04 if text == "First" else 0.01)
             processed_order.append(text)
             in_flight -= 1
 
-        async def process_turns_sequentially():
-            while True:
-                try:
-                    user_text = await turn_queue.get()
-                    await mock_handle_turn(user_text)
-                except asyncio.CancelledError:
-                    break
-                finally:
-                    turn_queue.task_done()
+        turn_mgr.start_consumer(mock_handler)
 
-        worker_task = asyncio.create_task(process_turns_sequentially())
+        assert turn_mgr.enqueue("First") is True
+        assert turn_mgr.enqueue("Second") is True
+        assert turn_mgr.enqueue("Third") is True
 
-        # Queue multiple rapid utterances
-        await turn_queue.put("First")
-        await turn_queue.put("Second")
-        await turn_queue.put("Third")
+        await turn_mgr.queue.join()
+        await turn_mgr.shutdown()
 
-        await turn_queue.join()
-        worker_task.cancel()
+        assert processed_order == ["First", "Second", "Third"], "Turns must execute in strict FIFO order"
+        assert max_concurrent == 1, "Only one turn must be in flight concurrently"
 
-        assert processed_order == ["First", "Second", "Third"], "Utterances must be processed in strict FIFO order"
-        assert max_concurrent == 1, "Only one backend turn must execute at a time"
-
-    asyncio.run(run_scenario())
+    asyncio.run(scenario())
 
 
-def test_worker_rapid_transcript_deduplication():
+def test_turn_queue_rapid_transcript_deduplication():
     """
-    Verifies that identical transcripts arriving within the deduplication window
-    are safely discarded to prevent double actions.
+    Verifies that rapid duplicate transcripts within the deduplication window
+    are ignored, while new or subsequent identical transcripts are enqueued.
     """
-    turn_queue: asyncio.Queue[str] = asyncio.Queue()
-    last_processed = {"text": "", "time": 0.0}
-    enqueued = []
+    turn_mgr = TurnQueueManager(deduplication_window_seconds=2.0)
 
-    def on_transcript(transcript: str, current_time: float):
-        user_text = transcript.strip()
-        if user_text.lower() == last_processed["text"].lower() and (current_time - last_processed["time"]) < 2.0:
-            return  # Deduplicated
-        last_processed["text"] = user_text
-        last_processed["time"] = current_time
-        enqueued.append(user_text)
-        turn_queue.put_nowait(user_text)
+    # 1. First utterance at t=10.0 -> enqueued
+    assert turn_mgr.enqueue("Book Dr. Aisha", timestamp=10.0) is True
 
-    # 1. First utterance at t=10.0
-    on_transcript("Book Dr. Aisha", 10.0)
-    # 2. Rapid duplicate at t=10.8 (e.g. repeated speech recognition event)
-    on_transcript("Book Dr. Aisha", 10.8)
-    # 3. Different utterance at t=11.2
-    on_transcript("Confirm appointment", 11.2)
-    # 4. Same utterance but after window at t=14.0
-    on_transcript("Confirm appointment", 14.0)
+    # 2. Duplicate within 2s at t=10.8 -> filtered out
+    assert turn_mgr.enqueue("Book Dr. Aisha", timestamp=10.8) is False
 
-    assert enqueued == ["Book Dr. Aisha", "Confirm appointment", "Confirm appointment"]
-    assert turn_queue.qsize() == 3
+    # 3. Case-insensitive duplicate at t=11.5 -> filtered out
+    assert turn_mgr.enqueue("book dr. aisha", timestamp=11.5) is False
+
+    # 4. Different utterance at t=11.8 -> enqueued
+    assert turn_mgr.enqueue("Confirm appointment", timestamp=11.8) is True
+
+    # 5. Same utterance after window at t=14.0 -> enqueued
+    assert turn_mgr.enqueue("Confirm appointment", timestamp=14.0) is True
+
+    assert turn_mgr.queue.qsize() == 3
+
+
+def test_turn_queue_idle_cancellation():
+    """
+    Verifies that cancelling an idle consumer (waiting on queue.get())
+    does not cause 'ValueError: task_done() called too many times'
+    and leaves no unhandled exceptions.
+    """
+    async def scenario():
+        turn_mgr = TurnQueueManager()
+
+        async def mock_handler(text: str):
+            pass
+
+        task = turn_mgr.start_consumer(mock_handler)
+        # Give the loop time to reach queue.get()
+        await asyncio.sleep(0.01)
+
+        # Idle consumer shutdown
+        await turn_mgr.shutdown()
+
+        assert task.done()
+        # Confirm no unhandled task exception occurred (e.g. ValueError)
+        try:
+            exc = task.exception()
+            assert exc is None, f"Expected clean task completion without unhandled exception, got {exc}"
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(scenario())
+
+
+def test_turn_queue_cancellation_during_processing():
+    """
+    Verifies that cancelling during active turn processing
+    cleans up without task_done accounting errors or orphaned tasks.
+    """
+    async def scenario():
+        turn_mgr = TurnQueueManager()
+        processing_started = asyncio.Event()
+
+        async def long_handler(text: str):
+            processing_started.set()
+            await asyncio.sleep(5.0)
+
+        task = turn_mgr.start_consumer(long_handler)
+        turn_mgr.enqueue("Long running task")
+
+        await processing_started.wait()
+
+        # Cancel while mid-flight
+        await turn_mgr.shutdown()
+
+        assert task.done()
+        try:
+            exc = task.exception()
+            assert exc is None, f"Expected no unhandled exception, got {exc}"
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(scenario())
+
+
+def test_turn_queue_failed_turn_followed_by_successful_turn():
+    """
+    Verifies that a failure during one turn does not crash the consumer loop,
+    allowing subsequent turns to be processed normally.
+    """
+    async def scenario():
+        turn_mgr = TurnQueueManager()
+        attempts = []
+
+        async def mock_handler(text: str):
+            attempts.append(text)
+            if text == "Failing turn":
+                raise RuntimeError("Simulated API failure")
+            await asyncio.sleep(0.01)
+
+        task = turn_mgr.start_consumer(mock_handler)
+
+        turn_mgr.enqueue("Failing turn")
+        turn_mgr.enqueue("Succeeding turn")
+
+        await turn_mgr.queue.join()
+        await turn_mgr.shutdown()
+
+        assert attempts == ["Failing turn", "Succeeding turn"]
+        assert task.done()
+
+    asyncio.run(scenario())
+
+
+def test_turn_queue_shutdown_no_orphaned_tasks():
+    """
+    Verifies that repeated start and shutdown cycles leave no running orphaned tasks.
+    """
+    async def scenario():
+        turn_mgr = TurnQueueManager()
+
+        async def mock_handler(text: str):
+            await asyncio.sleep(0.01)
+
+        task1 = turn_mgr.start_consumer(mock_handler)
+        turn_mgr.enqueue("Sample 1")
+        await turn_mgr.queue.join()
+        await turn_mgr.shutdown()
+        assert task1.done()
+
+        # Restart consumer
+        task2 = turn_mgr.start_consumer(mock_handler)
+        turn_mgr.enqueue("Sample 2")
+        await turn_mgr.queue.join()
+        await turn_mgr.shutdown()
+        assert task2.done()
+
+    asyncio.run(scenario())

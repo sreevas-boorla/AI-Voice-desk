@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta
+from typing import Tuple
 from sqlalchemy.orm import Session
 from app.database import SessionLocal, init_db
 from app.models import (
@@ -7,6 +8,57 @@ from app.models import (
 )
 from app.auth import hash_password
 from app.config import settings
+from app.services.availability_service import (
+    get_available_slots, parse_iso_datetime, get_now_ist
+)
+
+def find_valid_seed_slot(
+    db: Session,
+    provider_id: int,
+    preferred_start: datetime,
+    max_days_ahead: int = 14
+) -> Tuple[datetime, datetime]:
+    """
+    Selects a valid future slot in Asia/Kolkata using availability_service.
+    Bounds search to max_days_ahead and respects working hours, breaks, and non-working days.
+    Raises ValueError if no valid slot is available within bounds.
+    """
+    preferred_date = preferred_start.date()
+    pref_time = preferred_start.time()
+    first_fallback_slot = None
+
+    for day_offset in range(max_days_ahead):
+        cand_date = preferred_date + timedelta(days=day_offset)
+        slots = get_available_slots(db, provider_id, cand_date)
+        if not slots:
+            continue
+
+        if day_offset == 0:
+            # Check if preferred time is available
+            for s in slots:
+                s_start = parse_iso_datetime(s["start_time"])
+                if s_start.time() == pref_time:
+                    return s_start, parse_iso_datetime(s["end_time"])
+
+            # Next check if any slot on day 0 is >= pref_time
+            for s in slots:
+                s_start = parse_iso_datetime(s["start_time"])
+                if s_start.time() >= pref_time:
+                    return s_start, parse_iso_datetime(s["end_time"])
+
+            # Store first slot on day 0 as emergency fallback if subsequent days are unavailable
+            if not first_fallback_slot:
+                first_fallback_slot = (parse_iso_datetime(slots[0]["start_time"]), parse_iso_datetime(slots[0]["end_time"]))
+        else:
+            # On next available day, take first slot
+            return parse_iso_datetime(slots[0]["start_time"]), parse_iso_datetime(slots[0]["end_time"])
+
+    if first_fallback_slot:
+        return first_fallback_slot
+
+    raise ValueError(
+        f"No available slot found for provider {provider_id} within {max_days_ahead} days of {preferred_date}."
+    )
 
 def seed_database(db: Session, force_reset: bool = False):
     # 1. Admin User
@@ -200,37 +252,21 @@ def seed_database(db: Session, force_reset: bool = False):
             pr = providers[app["provider_name"]]
             srv = services[app["service_name"]]
 
-            # Verify availability against existing appointments and blocked slots
-            start_cand = app["start"]
-            end_cand = app["end"]
-            while True:
-                conflict_app = db.query(Appointment).filter(
-                    Appointment.provider_id == pr.id,
-                    Appointment.start_time == start_cand,
-                    Appointment.status.in_(["CONFIRMED", "RESCHEDULED"])
-                ).first()
-                conflict_block = db.query(BlockedSlot).filter(
-                    BlockedSlot.provider_id == pr.id,
-                    BlockedSlot.start_time < end_cand,
-                    BlockedSlot.end_time > start_cand
-                ).first()
-                if not conflict_app and not conflict_block:
-                    break
-                # Try next 30 min slot
-                start_cand += timedelta(minutes=30)
-                end_cand += timedelta(minutes=30)
+            # Select valid future slot in Asia/Kolkata respecting working hours, breaks, and days
+            start_cand, end_cand = find_valid_seed_slot(db, pr.id, app["start"], max_days_ahead=14)
 
             db.add(Appointment(
                 booking_reference=app["reference"],
                 patient_id=pt.id,
                 provider_id=pr.id,
                 service_id=srv.id,
-                start_time=start_cand,
-                end_time=end_cand,
+                start_time=start_cand.replace(tzinfo=None),
+                end_time=end_cand.replace(tzinfo=None),
                 status="CONFIRMED",
                 verification_code=app["code"],
                 notes=app["notes"]
             ))
+            db.flush()
         elif force_reset:
             # Force reset only when explicitly requested by admin reset operation
             existing_app.start_time = app["start"]
