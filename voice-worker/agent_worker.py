@@ -10,20 +10,57 @@ import os
 import sys
 import json
 import time
+import uuid
+import re
 import asyncio
 import logging
 from typing import Optional, Dict, Any, Set
 from dotenv import load_dotenv
 import httpx
 
-# Add voice-worker directory to sys.path so TurnQueueManager can be imported directly
+# Add voice-worker directory to sys.path so components can be imported directly
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from turn_manager import TurnQueueManager
+from speech_manager import ConfirmationSpeechManager, play_speech
 
 load_dotenv()
 
+
+class SensitiveDataFilter(logging.Filter):
+    """
+    Sanitizes any sensitive patterns (session tokens, room names, bearer tokens,
+    verification codes, phone numbers, API keys) from log records.
+    """
+    SENSITIVE_PATTERNS = [
+        (re.compile(r"room_sess_[a-zA-Z0-9_\-]+", re.IGNORECASE), "[ROOM_REDACTED]"),
+        (re.compile(r"sess_[a-zA-Z0-9_\-]+", re.IGNORECASE), "[SESSION_REDACTED]"),
+        (re.compile(r"Bearer\s+[a-zA-Z0-9._\-]+", re.IGNORECASE), "Bearer [REDACTED]"),
+        (re.compile(r"(\+?\d{1,3}[\s-]?)?(\d{5}[\s-]?\d{5}|\d{3}[\s-]?\d{3}[\s-]?\d{4}|\d{10})"), "[PHONE_REDACTED]"),
+        (re.compile(r"\b\d{4}\b"), "[CODE_REDACTED]"),
+        (re.compile(r"(gsk_[a-zA-Z0-9_\-]+|lk_[a-zA-Z0-9_\-]+)", re.IGNORECASE), "[API_KEY_REDACTED]")
+    ]
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.msg, str):
+            for pattern, repl in self.SENSITIVE_PATTERNS:
+                record.msg = pattern.sub(repl, record.msg)
+        if record.args:
+            if isinstance(record.args, tuple):
+                record.args = tuple(self._sanitize_value(a) for a in record.args)
+            elif isinstance(record.args, dict):
+                record.args = {k: self._sanitize_value(v) for k, v in record.args.items()}
+        return True
+
+    def _sanitize_value(self, val: Any) -> Any:
+        if isinstance(val, str):
+            for pattern, repl in self.SENSITIVE_PATTERNS:
+                val = pattern.sub(repl, val)
+        return val
+
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("voicedesk-worker")
+logger.addFilter(SensitiveDataFilter())
 
 LIVEKIT_URL = os.getenv("LIVEKIT_URL", "")
 LIVEKIT_API_KEY = os.getenv("LIVEKIT_API_KEY", "")
@@ -32,6 +69,7 @@ DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "")
 CARTESIA_API_KEY = os.getenv("CARTESIA_API_KEY", "")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 BACKEND_API_URL = os.getenv("BACKEND_API_URL", "http://127.0.0.1:8000/api")
+
 
 def check_credentials() -> Dict[str, bool]:
     """Inspects credential presence without leaking raw secrets into logs."""
@@ -42,12 +80,13 @@ def check_credentials() -> Dict[str, bool]:
         "llm_provider": bool(GROQ_API_KEY)
     }
 
-async def call_backend_agent(session_token: str, message: str) -> Dict[str, Any]:
+
+async def call_backend_agent(session_token: str, message: str, correlation_id: str = "worker") -> Dict[str, Any]:
     """
     Reuses the backend's core booking, verification, and confirmation rules.
     Ensures one user utterance produces exactly one agent response.
+    Never exposes raw message content or session tokens in log telemetry.
     """
-    correlation_id = session_token[:8] if session_token else "unknown"
     async with httpx.AsyncClient(timeout=30.0) as client:
         try:
             res = await client.post(
@@ -65,6 +104,7 @@ async def call_backend_agent(session_token: str, message: str) -> Dict[str, Any]
         except Exception as e:
             logger.error(f"[{correlation_id}] Connection error calling backend agent: {type(e).__name__}")
             return {"reply": "The clinic appointment system is temporarily unreachable. Please try again."}
+
 
 def run_worker():
     status = check_credentials()
@@ -90,14 +130,16 @@ def run_worker():
         async def entrypoint(ctx: JobContext):
             room_name = ctx.room.name
             session_token = room_name.replace("room_", "") if "room_" in room_name else room_name
-            correlation_id = session_token[:8] if session_token else "anon"
-            logger.info(f"[{correlation_id}] Connecting to LiveKit room: {room_name}")
+
+            # Generate random correlation ID completely unrelated to session tokens or secrets
+            correlation_id = f"corr-{uuid.uuid4().hex[:8]}"
+            logger.info(f"[{correlation_id}] Connecting to LiveKit room")
 
             await ctx.connect()
 
             # Wait for patient participant to join
             participant = await ctx.wait_for_participant()
-            logger.info(f"[{correlation_id}] Participant joined room: identity={participant.identity[:12]}...")
+            logger.info(f"[{correlation_id}] Remote participant joined voice session")
 
             if not status["deepgram_stt"] or not status["cartesia_tts"]:
                 logger.error(f"[{correlation_id}] DEEPGRAM_API_KEY or CARTESIA_API_KEY missing. Audio pipeline cannot stream.")
@@ -131,13 +173,19 @@ def run_worker():
 
             # TurnQueueManager handles FIFO sequencing, deduplication, and safe shutdown
             turn_mgr = TurnQueueManager(deduplication_window_seconds=2.0)
-            spoken_actions: Set[str] = set()
+
+            # ConfirmationSpeechManager handles authoritative confirmation retrieval and playback
+            speech_mgr = ConfirmationSpeechManager(
+                session_token=session_token,
+                correlation_id=correlation_id,
+                backend_api_url=BACKEND_API_URL
+            )
 
             async def handle_user_turn(user_text: str):
                 t0 = time.time()
                 logger.info(f"[{correlation_id}] Dispatching turn to backend agent (chars={len(user_text)})")
 
-                resp = await call_backend_agent(session_token, user_text)
+                resp = await call_backend_agent(session_token, user_text, correlation_id=correlation_id)
                 reply_text = resp.get("reply", "I am standing by.")
                 tool_events = resp.get("tool_events", [])
                 pending_action = resp.get("pending_action")
@@ -161,17 +209,18 @@ def run_worker():
                 except Exception as pe:
                     logger.warning(f"[{correlation_id}] Failed to publish room data packet: {type(pe).__name__}")
 
-                # Synthesize voice response back to the room audio track
+                # Synthesize voice response back to the room audio track using play_speech
                 logger.info(f"[{correlation_id}] Streaming synthesized agent response via TTS (chars={len(reply_text)})")
-                await session.say(reply_text, allow_interruptions=True)
+                await play_speech(session, reply_text)
 
             # Start sequential consumer task
             consumer_task = turn_mgr.start_consumer(handle_user_turn)
 
-            # Register async shutdown callback to cleanly cancel and await consumer task
+            # Register async shutdown callback to cleanly cancel and await consumer and speech tasks
             async def on_shutdown():
-                logger.info(f"[{correlation_id}] Room shutting down; draining turn consumer task.")
+                logger.info(f"[{correlation_id}] Room shutting down; draining turn consumer and speech tasks.")
                 await turn_mgr.shutdown()
+                await speech_mgr.shutdown()
 
             ctx.add_shutdown_callback(on_shutdown)
 
@@ -187,25 +236,25 @@ def run_worker():
                 else:
                     logger.info(f"[{correlation_id}] Rapid duplicate transcript filtered")
 
-            # Listen for data messages from client (e.g. authoritative confirmation results to speak)
+            # Listen for data messages from client (authoritative confirmation result notifications)
             @ctx.room.on("data_received")
             def on_data_received(packet: rtc.DataPacket):
                 try:
                     raw_text = packet.data.decode("utf-8")
                     data = json.loads(raw_text)
                     if data.get("type") == "confirmation_result":
-                        action_id = data.get("action_id")
-                        msg = data.get("message")
-                        # Speak authoritative result once; preserve session isolation & idempotency
-                        if action_id and msg and action_id not in spoken_actions:
-                            spoken_actions.add(action_id)
-                            logger.info(f"[{correlation_id}] Speaking authoritative confirmation result (action={action_id[:8]}...)")
-                            asyncio.create_task(session.say(msg, allow_interruptions=True))
+                        sender_identity = getattr(packet.participant, "identity", None)
+                        speech_mgr.handle_notification(
+                            sender_identity=sender_identity,
+                            expected_identity=participant.identity,
+                            packet_payload=data,
+                            speaker=session
+                        )
                 except Exception as de:
                     logger.warning(f"[{correlation_id}] Error handling room data packet: {type(de).__name__}")
 
             await session.start(agent=agent, room=ctx.room)
-            logger.info(f"[{correlation_id}] LiveKit AgentSession active in room {room_name}.")
+            logger.info(f"[{correlation_id}] LiveKit AgentSession active.")
 
         options = WorkerOptions(entrypoint_fnc=entrypoint)
         # Default to "start" command if invoked without explicit CLI subcommand
@@ -217,6 +266,7 @@ def run_worker():
         logger.warning(f"LiveKit agent plugins not installed: {e}. Install via `pip install -r requirements.txt`.")
     except Exception as e:
         logger.error(f"LiveKit agent worker runtime error: {e}")
+
 
 if __name__ == "__main__":
     run_worker()

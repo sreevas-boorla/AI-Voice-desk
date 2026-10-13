@@ -64,7 +64,7 @@ class TurnQueueManager:
                 except asyncio.CancelledError:
                     break
                 except Exception as e:
-                    logger.error(f"Error handling turn: {e}")
+                    logger.error(f"Error handling turn: {type(e).__name__}")
                 finally:
                     self.queue.task_done()
 
@@ -84,6 +84,6 @@ class TurnQueueManager:
             except asyncio.CancelledError:
                 pass
             except Exception as e:
-                logger.error(f"Error during consumer task shutdown: {e}")
+                logger.error(f"Error during consumer task shutdown: {type(e).__name__}")
             finally:
                 self._consumer_task = None

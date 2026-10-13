@@ -115,7 +115,7 @@ If you have configured LiveKit server and provider API keys:
 ```powershell
 cd voice-worker
 pip install -r requirements.txt
-python agent_worker.py
+python agent_worker.py start
 ```
 
 ---
@@ -156,9 +156,9 @@ When `ENVIRONMENT=production`, the application refuses startup if:
 - Default `ADMIN_PASSWORD` is used.
 - `DEMO_MODE=true` is enabled.
 
-### Live Credentials Disclosure
+### Live Credentials & Hardware Disclosures
 > [!NOTE]
-> In this local development and portfolio evaluation environment, no live external Groq API key or LiveKit server credentials were configured. The system gracefully operates with its deterministic simulator, dynamic database tools, and browser Web Speech API. Live tool calling, error handlers, and LiveKit token generation have been validated via automated tests.
+> In this local development and evaluation environment, external cloud credentials for Groq API, LiveKit Cloud, Deepgram STT, and Cartesia TTS were not present. The system operates with its deterministic simulator, dynamic database tools, and browser Web Speech API fallback. Live tool calling, error handlers, token generation, awaitable SpeechHandle processing, authoritative confirmation retrieval, and room message validation have been validated via automated tests. Real acoustic microphone/speaker hardware and cloud streaming remain unexecuted until external credentials are provided.
 
 ---
 
@@ -186,12 +186,20 @@ For portfolio testing, CareBridge Clinic seeds dynamic appointments relative to 
 
 ## Running Automated Tests
 
-### 1. Backend Business & Concurrency Suite (`pytest`)
-Executes 19 tests covering slot booking, unverified access blocking, reschedule confirmation requirement, decline state preservation, concurrent double-booking prevention, idempotent repeated confirmations, atomic reschedule rollbacks, Groq tool-calling loops, superseded pending action invalidation, production hardening, non-destructive re-seeding regressions, and LiveKit worker sequential turn queue / deduplication processing.
+### 1. Backend Business, Speech & Concurrency Suite (`pytest`)
+Executes **38 tests** covering:
+- **Core Criteria & Concurrency** (`test_all_criteria.py`): slot booking, unverified access blocking, reschedule confirmation requirement, decline state preservation, concurrent double-booking prevention, idempotent repeated confirmations, atomic reschedule rollbacks, and IST date calculations.
+- **Live Agent Tool Calling** (`test_live_agent.py`): Groq tool-calling loops, error resilience without silent simulation, live auth error messages, superseded action rejection, and production hardening.
+- **Bounded Availability Seeding** (`test_seed_availability.py`): break time avoidance, non-working day avoidance, rollover when fully booked, and bounded search failure.
+- **Non-Destructive Seeding Regressions** (`test_seeding_regression.py`): preservation of modified/cancelled records on re-seed and admin force-reset restoration.
+- **Turn Queue Manager** (`test_voice_worker.py`): strict FIFO execution, single in-flight turn constraint, rapid duplicate transcript filtering, idle cancellation, processing cancellation, failed turn recovery, and clean shutdown without unhandled exceptions.
+- **Authoritative Confirmation Speech** (`test_confirmation_speech.py`): awaitable `SpeechHandle` task wrapping, authoritative backend text generation, forged message rejection, wrong participant rejection, duplicate notification prevention, playback failure handling, and shutdown cancellation.
+- **Sensitive Data Redaction** (`test_logging_redaction.py`): regex redaction of session tokens, room names, phones, verification codes, bearer tokens, and API keys; random correlation ID generation; non-sensitive telemetry logging.
 
 ```powershell
 cd backend
 python -m pytest tests -v
+# 38 passed
 ```
 
 ### 2. End-to-End Browser Flow Suite (`Playwright`)

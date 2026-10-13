@@ -612,8 +612,7 @@ export const ReceptionistPage: React.FC<ReceptionistPageProps> = ({ isDemoMode }
           try {
             const payload = JSON.stringify({
               type: 'confirmation_result',
-              action_id: actionId,
-              message: res.message
+              action_id: actionId
             });
             const encoder = new TextEncoder();
             await roomRef.current.localParticipant.publishData(encoder.encode(payload), { reliable: true });

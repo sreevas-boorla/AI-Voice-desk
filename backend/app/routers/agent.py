@@ -1,4 +1,6 @@
 import uuid
+import json
+from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from app.database import get_db
@@ -6,8 +8,7 @@ from app.schemas import ChatRequest, ChatResponse, ConfirmActionRequest
 from app.services.verification_service import get_or_create_session
 from app.services.booking_service import confirm_pending_action
 from app.agent.engine import process_agent_message
-from app.models import Message, ConversationSession, VerificationSession
-from datetime import datetime
+from app.models import Message, ConversationSession, VerificationSession, PendingAction
 
 router = APIRouter(prefix="/api/agent", tags=["Agent"])
 
@@ -69,4 +70,67 @@ def get_session_history(session_token: str, db: Session = Depends(get_db)):
             }
             for m in messages
         ]
+    }
+
+@router.get("/action-result/{action_id}")
+def get_action_result(action_id: str, session_token: str, db: Session = Depends(get_db)):
+    """
+    Retrieves the authoritative persisted result of a confirmed or rejected action.
+    Pure read-only operation: does NOT execute or repeat mutations.
+    Enforces session isolation and rejects pending, superseded, or expired actions.
+    """
+    session = db.query(ConversationSession).filter(ConversationSession.session_token == session_token).first()
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found.")
+
+    pending = db.query(PendingAction).filter(
+        PendingAction.id == action_id
+    ).first()
+
+    if not pending:
+        raise HTTPException(status_code=404, detail="Action not found.")
+
+    # Cross-session verification: reject if action belongs to a different session
+    if pending.session_id != session.id:
+        raise HTTPException(status_code=403, detail="Cross-session action access forbidden.")
+
+    # Reject actions that have not reached a final persisted result state
+    if pending.status == "PENDING":
+        raise HTTPException(status_code=400, detail="Action is still pending confirmation.")
+    if pending.status == "SUPERSEDED":
+        raise HTTPException(status_code=400, detail="Action was superseded by a newer scheduling request.")
+    if pending.status == "EXPIRED":
+        raise HTTPException(status_code=400, detail="Action has expired.")
+
+    payload = json.loads(pending.payload_json) if pending.payload_json else {}
+
+    # Format authoritative message based on persisted database state
+    if pending.status == "CONFIRMED":
+        if pending.action_type == "BOOK":
+            ref = payload.get("booking_reference", "")
+            message = f"Your appointment has been successfully booked with reference {ref}."
+        elif pending.action_type == "RESCHEDULE":
+            ref = payload.get("booking_reference", "")
+            new_date = payload.get("new_formatted_date", "")
+            new_time = payload.get("new_formatted_time", "")
+            if new_date and new_time:
+                message = f"Appointment {ref} has been successfully rescheduled for {new_date} at {new_time}."
+            else:
+                message = f"Appointment {ref} has been successfully rescheduled."
+        elif pending.action_type == "CANCEL":
+            ref = payload.get("booking_reference", "")
+            message = f"Appointment {ref} has been successfully cancelled."
+        else:
+            message = "Your request has been successfully confirmed."
+    elif pending.status == "REJECTED":
+        message = "Action was cancelled. No changes were made to any appointments."
+    else:
+        raise HTTPException(status_code=400, detail=f"Invalid action status: {pending.status}")
+
+    return {
+        "action_id": pending.id,
+        "status": pending.status,
+        "action_type": pending.action_type,
+        "message": message,
+        "details": payload
     }
