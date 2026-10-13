@@ -52,8 +52,9 @@ def process_agent_message(
 
     if use_live_llm and settings.GROQ_API_KEY:
         try:
+            import groq
             from groq import Groq
-            client = Groq(api_key=settings.GROQ_API_KEY)
+            client = Groq(api_key=settings.GROQ_API_KEY, timeout=settings.GROQ_TIMEOUT_SECONDS)
             # Fetch last 10 messages for context
             history = db.query(Message).filter(Message.session_id == session_id).order_by(Message.created_at.asc()).all()[-10:]
             messages_payload = [{"role": "system", "content": SYSTEM_PROMPT}]
@@ -64,19 +65,21 @@ def process_agent_message(
             # Tool outputs must reach the model before it can choose its next step.
             for _ in range(8):
                 response = client.chat.completions.create(
-                    model="llama-3.3-70b-versatile", messages=messages_payload,
+                    model=settings.GROQ_MODEL,
+                    messages=messages_payload,
                     tools=[{"type": "function", "function": t} for t in TOOLS_SCHEMA
                            if t["name"] != "confirm_pending_action"],
                     tool_choice="auto",
+                    timeout=settings.GROQ_TIMEOUT_SECONDS,
                 )
                 choice = response.choices[0].message
                 if not choice.tool_calls:
-                    reply_text = choice.content or "Please use the confirmation card to approve any changes."
+                    reply_text = choice.content or "Please review and use the confirmation card to finalize any pending changes."
                     break
                 messages_payload.append(choice.model_dump(exclude_none=True))
                 for tc in choice.tool_calls:
                     if tc.function.name == "confirm_pending_action":
-                        raise ValueError("Changes require the confirmation card.")
+                        raise ValueError("Mutations require explicit user approval via the confirmation card.")
                     ev = executor.execute_tool(tc.function.name, json.loads(tc.function.arguments))
                     tool_events.append(ToolExecutionEvent(
                         tool_name=ev["tool_name"], status=ev["status"],
@@ -86,14 +89,32 @@ def process_agent_message(
                         }, result_summary=ev["result_summary"],
                         timestamp=datetime.utcnow().isoformat(),
                     ))
+                    if ev["status"] == "success" and ev["tool_name"] in ("prepare_booking", "prepare_reschedule", "prepare_cancellation"):
+                        p_data = ev["data"]
+                        pending_action_out = PendingActionSummary(
+                            action_id=p_data["action_id"],
+                            action_type=p_data["action_type"],
+                            summary_text=p_data["summary_text"],
+                            expires_at=p_data["expires_at"],
+                            details=p_data["details"]
+                        )
                     messages_payload.append({"role": "tool", "tool_call_id": tc.id,
                         "content": json.dumps({"status": ev["status"], "data": ev["data"],
                                                "summary": ev["result_summary"]}, default=str)})
             else:
-                reply_text = "I reached the investigation limit. Please narrow your request or use the confirmation card."
-        except Exception:
-            # Never replay a request through a simulator after tools may have run.
-            reply_text = "The live AI service is unavailable. Please try again. No action is confirmed by this message; review any pending confirmation card."
+                reply_text = "I reached the tool execution limit. Please narrow your request or review any pending confirmation card."
+        except Exception as e:
+            # Handle specific Groq errors if groq is imported and error is from groq
+            err_type = type(e).__name__
+            if "AuthenticationError" in err_type or "PermissionDenied" in err_type:
+                reply_text = "The live AI provider rejected authentication. Please verify GROQ_API_KEY in your local environment."
+            elif "RateLimit" in err_type:
+                reply_text = "The live AI provider is currently rate-limited. Please wait a moment and try again."
+            elif "Timeout" in err_type or "Connection" in err_type:
+                reply_text = "The live AI request timed out or encountered a connection error. Please try again."
+            else:
+                # Never replay a request through a simulator after tools may have run.
+                reply_text = "The live AI service is unavailable. Please try again. No action is confirmed by this message; review any pending confirmation card."
     elif not settings.DEMO_MODE:
         reply_text = "Live AI requires a GROQ_API_KEY on the server. Configure it or explicitly enable DEMO_MODE for the simulator."
     else:

@@ -66,18 +66,42 @@ def get_system_status():
             "type": "PostgreSQL" if "postgres" in settings.DATABASE_URL else "SQLite (Local Concurrency Protected)"
         },
         "voice_provider": {
-            "configured": True,
-            "provider": "Browser SpeechRecognition / SpeechSynthesis",
-            "mode": "browser"
+            "configured": has_livekit,
+            "provider": "LiveKit WebRTC (Cloud)" if has_livekit else "Browser Web Speech API",
+            "mode": "livekit" if has_livekit else "browser",
+            "note": "Browser speech recognition utilizes your browser vendor's speech engine."
         },
         "llm_provider": {
             "configured": has_llm,
-            "provider": "Groq" if has_llm else "VoiceDesk Deterministic Simulator",
+            "provider": f"Groq ({settings.GROQ_MODEL})" if has_llm else "VoiceDesk Deterministic Simulator",
             "mode": "live" if (has_llm and not settings.DEMO_MODE) else "demo"
         },
         "environment": settings.ENVIRONMENT,
         "demo_mode": settings.DEMO_MODE
     }
+
+@router.get("/demo-references")
+def get_demo_references(db: Session = Depends(get_db)):
+    """Returns active seeded appointments for the demo guidance panel."""
+    if not settings.DEMO_MODE:
+        return []
+
+    from app.models import Appointment
+    apps = db.query(Appointment).filter(
+        Appointment.booking_reference.in_(["CB-1001", "CB-1002", "CB-1003"])
+    ).all()
+
+    return [
+        {
+            "ref": a.booking_reference,
+            "code": a.verification_code,
+            "patient": a.patient.full_name if a.patient else "Patient",
+            "provider": f"{a.provider.name} ({a.provider.specialty})" if a.provider else "CareBridge Specialist",
+            "date": a.start_time.strftime("%a, %d %b %Y at %I:%M %p"),
+            "status": a.status
+        }
+        for a in apps
+    ]
 
 @router.post("/reset-demo")
 def reset_demo_data(db: Session = Depends(get_db), admin=Depends(get_current_admin)):

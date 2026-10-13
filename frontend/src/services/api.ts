@@ -63,6 +63,25 @@ export async function fetchVoiceStatus() {
   return res.json();
 }
 
+export async function fetchDemoReferences() {
+  const res = await fetch(`${API_BASE}/system/demo-references`);
+  if (!res.ok) return [];
+  return res.json();
+}
+
+export async function requestLiveKitToken(sessionToken: string, participantName: string = 'Patient') {
+  const res = await fetch(`${API_BASE}/voice/token`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ session_token: sessionToken, participant_name: participantName })
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: 'Failed to obtain LiveKit token' }));
+    throw new Error(err.detail || 'LiveKit token error');
+  }
+  return res.json();
+}
+
 export async function resetDemoData() {
   const res = await fetch(`${API_BASE}/system/reset-demo`, { method: 'POST', headers: { Authorization: `Bearer ${localStorage.getItem('voicedesk_admin_token') || ''}` } });
   if (!res.ok) {

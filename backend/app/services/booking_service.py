@@ -159,6 +159,13 @@ def prepare_booking(
         "notes": notes
     }
 
+    # Invalidate any earlier pending actions for this session
+    for ep in db.query(PendingAction).filter(
+        PendingAction.session_id == session_id,
+        PendingAction.status == "PENDING"
+    ).all():
+        ep.status = "SUPERSEDED"
+
     pending = PendingAction(
         session_id=session_id,
         action_type="BOOK",
@@ -233,6 +240,13 @@ def prepare_reschedule(
         "new_formatted_time": f"{new_start_dt.strftime('%I:%M %p')} - {new_end_dt.strftime('%I:%M %p')}"
     }
 
+    # Invalidate any earlier pending actions for this session
+    for ep in db.query(PendingAction).filter(
+        PendingAction.session_id == session_id,
+        PendingAction.status == "PENDING"
+    ).all():
+        ep.status = "SUPERSEDED"
+
     pending = PendingAction(
         session_id=session_id,
         action_type="RESCHEDULE",
@@ -288,6 +302,13 @@ def prepare_cancellation(
         "formatted_date": start_aware.strftime("%A, %d %B %Y at %I:%M %p"),
         "reason": reason or "Patient requested cancellation"
     }
+
+    # Invalidate any earlier pending actions for this session
+    for ep in db.query(PendingAction).filter(
+        PendingAction.session_id == session_id,
+        PendingAction.status == "PENDING"
+    ).all():
+        ep.status = "SUPERSEDED"
 
     pending = PendingAction(
         session_id=session_id,
@@ -350,6 +371,17 @@ def confirm_pending_action(
             "message": "This action was previously declined.",
             "action_type": pending.action_type
         }
+
+    if pending.status == "SUPERSEDED":
+        return {
+            "success": False,
+            "status": "SUPERSEDED",
+            "message": "This action was superseded by a newer scheduling request. Please confirm your most recent request.",
+            "action_type": pending.action_type
+        }
+
+    if pending.status != "PENDING":
+        raise ValueError(f"Action '{action_id}' is no longer pending (status: {pending.status}).")
 
     if pending.expires_at < datetime.utcnow():
         pending.status = "EXPIRED"

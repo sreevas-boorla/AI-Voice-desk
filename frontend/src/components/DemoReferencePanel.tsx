@@ -1,5 +1,6 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { KeyRound, Copy, Check, Sparkles, ChevronDown, ChevronUp, Send } from 'lucide-react';
+import { fetchDemoReferences } from '../services/api';
 
 interface DemoReferencePanelProps {
   onSelectPrompt: (promptText: string) => void;
@@ -8,30 +9,37 @@ interface DemoReferencePanelProps {
 export const DemoReferencePanel: React.FC<DemoReferencePanelProps> = ({ onSelectPrompt }) => {
   const [isOpen, setIsOpen] = useState(true);
   const [copiedCode, setCopiedCode] = useState<string | null>(null);
-
-  const sampleBookings = [
+  const [sampleBookings, setSampleBookings] = useState<any[]>([
     {
       ref: 'CB-1001',
       code: '4821',
       patient: 'Rahul Sharma',
       provider: 'Dr. Aisha Rao (General Physician)',
-      date: 'Tue, 13 Oct 2026 at 10:00 AM'
+      date: 'Next Available Weekday at 10:00 AM'
     },
     {
       ref: 'CB-1002',
       code: '7390',
       patient: 'Ananya Reddy',
       provider: 'Dr. Vikram Patel (Pediatrician)',
-      date: 'Wed, 14 Oct 2026 at 11:30 AM'
+      date: 'Next Working Day at 11:30 AM'
     },
     {
       ref: 'CB-1003',
       code: '1945',
       patient: 'Karthik Verma',
       provider: 'Dr. Meera Nambiar (Dermatologist)',
-      date: 'Thu, 15 Oct 2026 at 03:00 PM'
+      date: 'Next Working Day at 03:00 PM'
     }
-  ];
+  ]);
+
+  useEffect(() => {
+    fetchDemoReferences().then((data) => {
+      if (data && data.length > 0) {
+        setSampleBookings(data);
+      }
+    }).catch(() => {});
+  }, []);
 
   const quickPrompts = [
     {

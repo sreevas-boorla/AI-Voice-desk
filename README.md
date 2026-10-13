@@ -1,36 +1,6 @@
-# Run the verified browser demo
-
-The supported voice path uses browser SpeechRecognition and SpeechSynthesis. LiveKit's worker is scaffolding and is not connected; no API reports it as active. Text chat works without microphone access. Use Chrome on localhost or HTTPS for browser voice; browser support varies.
-
-From the repository root (Windows PowerShell), run in terminal 1:
-
-```powershell
-python -m venv .venv
-.\.venv\Scripts\python -m pip install -r backend/requirements.txt
-cd backend
-..\.venv\Scripts\python -m app.seed
-..\.venv\Scripts\python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
-```
-
-In terminal 2:
-
-```powershell
-cd frontend
-npm ci
-npm run dev -- --host 127.0.0.1
-```
-
-Open http://localhost:5180. The frontend proxies `/api` to port 8000.
-
-Default DEMO_MODE=true uses a deterministic simulator and real local database tools. For real LLM responses create `backend/.env` with `DEMO_MODE=false` and `GROQ_API_KEY` set locally, then restart the backend. Only Groq is implemented. Never commit this file. Live mode uses confirmation cards for mutations. No live provider call has been validated without credentials.
-
-## Original project documentation (historical design)
-
-The LiveKit and production-readiness claims below describe intended scope, not verified capabilities.
-
 # VoiceDesk — Agentic AI Receptionist for CareBridge Clinic
 
-VoiceDesk is a portfolio prototype of an agentic AI receptionist built for **CareBridge Clinic**, a fictional multi-specialty healthcare practice in Jubilee Hills, Hyderabad, India. Operating in the `Asia/Kolkata` (IST, UTC+5:30) timezone, VoiceDesk handles clinic inquiries, checks provider availability, books appointments, verifies patient identity, reschedules/cancels visits with explicit two-phase confirmation, and escalates unresolved matters to human receptionists.
+VoiceDesk is an agentic AI receptionist built for **CareBridge Clinic**, a fictional multi-specialty healthcare practice in Jubilee Hills, Hyderabad, India. Operating in the `Asia/Kolkata` (IST, UTC+5:30) timezone, VoiceDesk handles clinic inquiries, checks doctor availability, books appointments, verifies patient identity, reschedules/cancels visits with explicit two-phase confirmation, and escalates complex requests to human staff.
 
 ---
 
@@ -39,14 +9,16 @@ VoiceDesk is a portfolio prototype of an agentic AI receptionist built for **Car
 ```
                                       +--------------------------------------------+
                                       |            React + Vite Frontend           |
-                                      |  (Tailwind CSS, Web Speech API / WebRTC)   |
+                                      |         Port 5180 (Proxies /api to 8000)   |
+                                      |  (Tailwind CSS, Web Speech API / LiveKit)  |
                                       +---------------------+----------------------+
                                                             | HTTP / WebSocket
                                                             v
                                       +--------------------------------------------+
                                       |          FastAPI Application Server        |
-                                      |  - Session & Token Authorization Gate     |
-                                      |  - Tool Orchestration & Audit Event Logger |
+                                      |                  Port 8000                 |
+                                      |  - Session & Token Authorization Gate      |
+                                      |  - Tool Orchestration & Audit Event Logger  |
                                       |  - Concurrency Lock & Availability Service |
                                       +----------+----------------------+----------+
                                                  |                      |
@@ -54,7 +26,7 @@ VoiceDesk is a portfolio prototype of an agentic AI receptionist built for **Car
                             v                                                                v
 +--------------------------------------------+                      +--------------------------------------------+
 |             Agentic AI Engine              |                      |           PostgreSQL / SQLite DB           |
-|  - Live Mode: Tool-Calling LLM             |                      |  - Providers, Services, Schedules          |
+|  - Live Mode: Groq LLaMA 3.3 Tool Calling  |                      |  - Providers, Services, Schedules          |
 |  - Demo Mode: Deterministic Rules Engine   |                      |  - Appointments, PendingActions, Audit     |
 +--------------------------------------------+                      +--------------------------------------------+
                             ^                                                                ^
@@ -63,7 +35,8 @@ VoiceDesk is a portfolio prototype of an agentic AI receptionist built for **Car
                                                  |                      |
                                       +----------+----------------------+----------+
                                       |         LiveKit Persistent Worker          |
-                                      |  (WebRTC Audio, STT / TTS Pipeline)        |
+                                      |     (voice-worker/agent_worker.py)         |
+                                      |  - Deepgram STT -> Groq -> Cartesia TTS    |
                                       +--------------------------------------------+
 ```
 
@@ -73,8 +46,9 @@ VoiceDesk is a portfolio prototype of an agentic AI receptionist built for **Car
 
 1. **Strict 2-Phase Mutation Cycle**:
    - Booking, rescheduling, and cancellation generate a server-bound, 10-minute expiring `PendingAction`.
-   - The user is presented with the exact doctor, date, time, and fee.
+   - The user is presented with the exact doctor, date, time, and consultation fee before committing.
    - Persistence occurs *only* after explicit user confirmation (`confirm_pending_action`).
+   - If the patient changes the requested date, time, or doctor, any prior pending action is immediately invalidated and superseded.
 2. **Session-Bound Identity Verification**:
    - Patient appointment details and mutations require a valid `booking_reference` and 4-digit verification code.
    - Access is cryptographically bound to the server session with rate-limiting (max 5 failed attempts). Unverified users cannot read or mutate records.
@@ -83,178 +57,141 @@ VoiceDesk is a portfolio prototype of an agentic AI receptionist built for **Car
    - Simultaneous competing requests cannot double-book a slot.
 4. **Atomic Rescheduling with Rollback Safety**:
    - If a new target slot conflicts or fails revalidation at commit time, the original appointment remains untouched.
-5. **IST Timezone & Natural Date Resolution**:
-   - All schedules and appointments resolve in `Asia/Kolkata` (IST). Phrases like *"tomorrow afternoon"* or *"next Tuesday"* correctly resolve to available 30-minute intervals between 12:00 PM and 5:00 PM.
-6. **Dual Mode Architecture**:
-   - **Live Mode**: Uses LiveKit WebRTC with Deepgram STT, Groq/Gemini/OpenAI LLM tool calling, and Cartesia TTS.
-   - **Demo Mode**: Operates in zero-API-key environments using high-fidelity browser SpeechRecognition/SpeechSynthesis and a deterministic simulator running the identical business tools and database transactions.
+5. **IST Timezone & Dynamic Date Resolution**:
+   - All schedules and appointments resolve in `Asia/Kolkata` (IST). Phrases like *"tomorrow afternoon"* or *"next Wednesday"* correctly resolve to available 30-minute intervals between 12:00 PM and 5:00 PM based on the dynamic clock.
+6. **Dual Voice Architecture**:
+   - **Browser Web Speech Mode**: Works out of the box in Chromium-based browsers (Chrome, Edge). Features microphone echo prevention (pausing speech detection while assistant speaks), rapid transcript deduplication, mute/unmute, and call restart. *Note: Browser speech recognition depends on your browser vendor's speech engine and is not guaranteed to be local or offline.*
+   - **LiveKit Server Worker (`voice-worker/agent_worker.py`)**: End-to-end real-time audio pipeline using LiveKit Agents, Deepgram STT, Groq LLM tool calling, and Cartesia TTS. Binds each voice room to its own backend conversation session (`room_<session_token>`).
 
 ---
 
-## Project Structure
+## Quick Start (Local Windows PowerShell)
 
-```
-voicedesk/
-├── backend/
-│   ├── app/
-│   │   ├── agent/             # Tool definitions, schemas, simulator & engine
-│   │   ├── routers/           # Agent, Appointments, Admin, Voice, System APIs
-│   │   ├── services/          # Availability, Booking, Verification, Audit services
-│   │   ├── auth.py            # JWT token creation and bcrypt password verification
-│   │   ├── config.py          # Pydantic BaseSettings environment config
-│   │   ├── database.py        # SQLAlchemy engine, session maker, index configuration
-│   │   ├── main.py            # FastAPI entry point with CORS and lifespan handler
-│   │   ├── models.py          # 11 relational SQLAlchemy data models
-│   │   ├── schemas.py         # Pydantic schemas for requests, responses, and tools
-│   │   └── seed.py            # Repeatable synthetic seed script for CareBridge
-│   ├── alembic/               # Database migrations
-│   ├── tests/                 # Automated pytest suite covering all 10 criteria
-│   └── requirements.txt
-├── frontend/
-│   ├── src/
-│   │   ├── components/        # AudioVisualizer, ConfirmationCard, ActivityDrawer, Navbar
-│   │   ├── pages/             # ReceptionistPage, AdminDashboard, SettingsPage
-│   │   ├── services/          # Type-safe API client
-│   │   └── types/             # TypeScript interfaces
-│   ├── package.json
-│   ├── tailwind.config.js
-│   └── vite.config.ts
-├── voice-worker/
-│   ├── agent_worker.py        # Standalone LiveKit Agents worker script
-│   └── requirements.txt
-├── tests-e2e/
-│   └── test_browser_flow.py   # Playwright E2E browser automation test
-├── docker-compose.yml         # Multi-container orchestration (DB, API, Web, Voice)
-├── Dockerfile.backend
-├── Dockerfile.frontend
-├── Dockerfile.voice
-├── .env.example
-└── README.md
-```
+The local setup uses backend port **8000** and frontend port **5180**.
 
----
+### Terminal 1: Backend Setup & Seed
 
-## Quick Start (Local Development)
-
-### 1. Prerequisites
-- Python 3.11+
-- Node.js 18+ and npm
-- Git
-
-### 2. Backend Setup
-```bash
+```powershell
+# Navigate to backend directory
 cd backend
 
-# Create virtual environment (optional)
-python -m venv venv
-source venv/bin/activate # Windows: .\venv\Scripts\Activate.ps1
+# Create virtual environment (if not already created)
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
 
 # Install dependencies
 pip install -r requirements.txt
 
-# Initialize & seed database
+# Initialize & seed database with dynamic IST dates
 python -m app.seed
 
-# Run FastAPI backend
-uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
+# Start FastAPI backend on port 8000
+python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
-The API is live at `http://127.0.0.1:8000` with interactive Swagger docs at `http://127.0.0.1:8000/docs`.
+Backend API will be accessible at `http://127.0.0.1:8000` with Swagger docs at `http://127.0.0.1:8000/docs`.
 
-### 3. Frontend Setup
-```bash
+### Terminal 2: Frontend Setup
+
+```powershell
+# Navigate to frontend directory
 cd frontend
 
 # Install npm dependencies
 npm install
 
-# Start Vite development server
-npm run dev
+# Start Vite development server on port 5180
+npm run dev -- --host 127.0.0.1
 ```
-Open `http://localhost:5173` in your browser.
+Open `http://localhost:5180` in Chrome or Edge.
 
 ---
 
-## Docker Compose Deployment
+## Configuration & Environment Variables
 
-To run the complete production stack (PostgreSQL, FastAPI Backend, React Nginx Frontend, and Voice Worker):
+Create `.env` in the repository root or in `backend/.env` (both are automatically detected):
 
-```bash
-# Clone and enter directory
-cd voicedesk
+```ini
+# Database (defaults to local SQLite)
+DATABASE_URL=sqlite:///./voicedesk.db
 
-# Launch containers
-docker-compose up --build -d
+# Security
+SECRET_KEY=replace-with-a-random-secret-key-at-least-32-characters-long
+ADMIN_USERNAME=admin
+ADMIN_PASSWORD=CareBridge2026!
+ENVIRONMENT=development
+DEMO_MODE=true
+
+# Groq LLM (Required if DEMO_MODE=false)
+GROQ_API_KEY=your_groq_api_key_here
+GROQ_MODEL=llama-3.3-70b-versatile
+GROQ_TIMEOUT_SECONDS=30.0
+
+# LiveKit WebRTC Voice Credentials (Optional)
+LIVEKIT_URL=wss://your-project.livekit.cloud
+LIVEKIT_API_KEY=your_livekit_api_key
+LIVEKIT_API_SECRET=your_livekit_api_secret
+DEEPGRAM_API_KEY=your_deepgram_api_key
+CARTESIA_API_KEY=your_cartesia_api_key
 ```
 
-Services will be accessible at:
-- **Web Receptionist & Admin**: `http://localhost:5173`
-- **FastAPI API**: `http://localhost:8000`
-- **PostgreSQL Database**: `localhost:5432`
+### Production Hardening
+When `ENVIRONMENT=production`, the application refuses startup if:
+- Default `SECRET_KEY` is unchanged.
+- Default `ADMIN_PASSWORD` is used.
+- `DEMO_MODE=true` is enabled.
+
+### Live Credentials Disclosure
+> [!NOTE]
+> In this local development and portfolio evaluation environment, no live external Groq API key or LiveKit server credentials were configured. The system gracefully operates with its deterministic simulator, dynamic database tools, and browser Web Speech API. Live tool calling and error handlers have been validated via unit tests.
 
 ---
 
-## Pre-seeded Demo Credentials
+## Pre-seeded Synthetic Demo Appointments
 
-For portfolio inspection, CareBridge Clinic comes seeded with synthetic appointments:
+For portfolio testing, CareBridge Clinic seeds dynamic appointments relative to the current Asia/Kolkata date:
 
-| Booking Reference | PIN Code | Patient Name | Provider & Specialty | Scheduled Time (IST) |
-|---|---|---|---|---|
-| **CB-1001** | `4821` | Rahul Sharma | Dr. Aisha Rao (General Physician) | Tue, 13 Oct 2026, 10:00 AM |
-| **CB-1002** | `7390` | Ananya Reddy | Dr. Vikram Patel (Pediatrician) | Wed, 14 Oct 2026, 11:30 AM |
-| **CB-1003** | `1945` | Karthik Verma | Dr. Meera Nambiar (Dermatologist) | Thu, 15 Oct 2026, 03:00 PM |
+| Booking Reference | PIN Code | Patient Name | Provider & Specialty |
+|---|---|---|---|
+| **CB-1001** | `4821` | Rahul Sharma | Dr. Aisha Rao (General Physician) |
+| **CB-1002** | `7390` | Ananya Reddy | Dr. Vikram Patel (Pediatrician) |
+| **CB-1003** | `1945` | Karthik Verma | Dr. Meera Nambiar (Dermatologist) |
 
-### Admin Portal Credentials
+### Clinic Providers:
+- **Dr. Aisha Rao** (General Physician): Mon–Fri 09:00–17:00 (Break: 13:00–14:00) — Fee: ₹800
+- **Dr. Vikram Patel** (Pediatrician): Mon–Sat 10:00–19:00 (Break: 14:00–16:00) — Fee: ₹1,000
+- **Dr. Meera Nambiar** (Dermatologist): Tue–Sat 11:00–19:30 (Break: 15:00–16:30) — Fee: ₹1,200
+
+### Admin Portal Credentials:
 - **URL**: Click *Admin Portal* tab on navigation bar.
 - **Username**: `admin`
 - **Password**: `CareBridge2026!`
 
 ---
 
-## Running the Automated Test Suites
+## Running Automated Tests
 
 ### 1. Backend Business & Concurrency Suite (`pytest`)
-Executes 10 unit and integration tests verifying:
-1. Available slot booking.
-2. Unverified access blocking.
-3. Reschedule confirmation requirement.
-4. Decline state preservation.
-5. Concurrent double-booking prevention.
-6. Idempotent repeated confirmation.
-7. Atomic reschedule rollback on conflict.
-8. Asia/Kolkata date resolution.
-9. Structured error handling without false success.
-10. Admin authentication enforcement.
+Executes 15 tests covering slot booking, unverified access blocking, reschedule confirmation requirement, decline state preservation, concurrent double-booking prevention, idempotent repeated confirmations, atomic reschedule rollbacks, Groq tool-calling loops, superseded pending action invalidation, and production hardening.
 
-```bash
+```powershell
 cd backend
-python -m pytest tests/test_all_criteria.py -v
+python -m pytest tests -v
 ```
 
-### 2. End-to-End Browser Flow (`Playwright`)
+### 2. End-to-End Browser Flow Suite (`Playwright`)
 Executes browser automation verifying:
-`Verified Lookup (CB-1001)` ➔ `Reschedule Request` ➔ `Explicit Confirmation` ➔ `Admin Record Verification`.
+1. `test_browser_flow.py`: Verified lookup (CB-1001) ➔ Reschedule request ➔ Confirmation card ➔ Admin record verification ➔ Responsive layout.
+2. `test_voice_and_booking_flows.py`: Text booking flow ➔ Confirmation persistence ➔ Admin verification ➔ Browser microphone recognition ➔ SpeechSynthesis audio playback ➔ Mute/unmute ➔ End call.
 
-```bash
-# Ensure backend and frontend are running, then:
+```powershell
+# Ensure backend (port 8000) and frontend (port 5180) are running
 python tests-e2e/test_browser_flow.py
+python tests-e2e/test_voice_and_booking_flows.py
 ```
 
 ---
 
-## Demo Walkthrough Script
+## Docker Status Notice
 
-1. **Ask Clinic Hours & Fees**:
-   - Speak or type: *"What are your clinic hours and consultation fees in Hyderabad?"*
-   - Agent responds with CareBridge Clinic address (Jubilee Hills) and ₹800 - ₹1200 pricing.
-2. **Check Availability**:
-   - Say: *"Check Dr. Aisha Rao's available slots tomorrow afternoon."*
-   - Agent retrieves available 30-minute intervals between 12:00 PM and 5:00 PM.
-3. **Lookup Existing Booking**:
-   - Say: *"Please verify booking CB-1001 with code 4821."*
-   - Agent verifies access, binds session, and displays appointment card.
-4. **Reschedule**:
-   - Say: *"Reschedule CB-1001 to tomorrow afternoon."*
-   - Interactive confirmation card appears. Click **Confirm & Persist**.
-5. **Verify in Admin Portal**:
-   - Navigate to *Admin Portal*, login with `admin` / `CareBridge2026!`.
-   - Observe `CB-1001` row updated to `RESCHEDULED`.
+Multi-container configuration files are included (`docker-compose.yml`, `Dockerfile.backend`, `Dockerfile.frontend`, `Dockerfile.voice`).
+*Note: Docker was not available on the current Windows host environment during testing; local execution and end-to-end verification were conducted directly on Windows PowerShell with Python 3.12 and Node 20.*

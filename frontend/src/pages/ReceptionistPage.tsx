@@ -39,12 +39,38 @@ export const ReceptionistPage: React.FC<ReceptionistPageProps> = ({ isDemoMode }
   const voiceActiveRef = useRef(false);
   const mutedRef = useRef(false);
   const busyRef = useRef(false);
+  const isSpeakingRef = useRef(false);
+  const lastSubmissionRef = useRef<{ text: string; time: number }>({ text: '', time: 0 });
+  const sessionTokenRef = useRef(sessionToken);
+  sessionTokenRef.current = sessionToken;
+  const modeRef = useRef(mode);
+  modeRef.current = mode;
+  const isVoiceActiveRef = useRef(isVoiceActive);
+  isVoiceActiveRef.current = isVoiceActive;
+
   const submitRef = useRef<(text: string) => Promise<void>>(async () => {});
-  useEffect(() => () => {
-    voiceActiveRef.current = false;
-    recognitionRef.current?.abort();
-    synthRef.current?.cancel();
+
+  // Cleanup on unmount or tab close
+  useEffect(() => {
+    return () => {
+      voiceActiveRef.current = false;
+      isSpeakingRef.current = false;
+      try { recognitionRef.current?.abort(); } catch (_) {}
+      try { synthRef.current?.cancel(); } catch (_) {}
+    };
   }, []);
+
+  // Mode switch listener: gracefully shutdown voice engine when switching to text
+  useEffect(() => {
+    if (mode === 'text') {
+      voiceActiveRef.current = false;
+      isSpeakingRef.current = false;
+      setIsVoiceActive(false);
+      setVoiceState('idle');
+      try { recognitionRef.current?.stop(); } catch (_) {}
+      try { synthRef.current?.cancel(); } catch (_) {}
+    }
+  }, [mode]);
 
   // Auto-scroll transcript
   useEffect(() => {
@@ -87,6 +113,11 @@ export const ReceptionistPage: React.FC<ReceptionistPageProps> = ({ isDemoMode }
       };
 
       recognition.onresult = (event: any) => {
+        // Prevent audio echo loop: ignore microphone input if assistant is currently speaking
+        if (isSpeakingRef.current) {
+          return;
+        }
+
         const lastIndex = event.results.length - 1;
         const transcript = event.results[lastIndex][0].transcript.trim();
         if (transcript) {
@@ -99,9 +130,12 @@ export const ReceptionistPage: React.FC<ReceptionistPageProps> = ({ isDemoMode }
           setVoiceError('Microphone permission was denied. Please allow microphone access or use text mode.');
           setVoiceState('error');
           voiceActiveRef.current = false;
-    setIsVoiceActive(false);
+          setIsVoiceActive(false);
+        } else if (event.error === 'network') {
+          setVoiceError('Browser speech recognition network service unavailable. Text Chat Mode remains fully functional.');
+          setVoiceState('error');
         } else if (event.error !== 'no-speech') {
-          setVoiceError(`Audio input error: ${event.error}`);
+          setVoiceError(`Audio input error: ${event.error}. You can retry or switch to Text Mode.`);
           setVoiceState('error');
         }
       };
@@ -123,7 +157,7 @@ export const ReceptionistPage: React.FC<ReceptionistPageProps> = ({ isDemoMode }
 
   // Speak AI response with TTS
   const speakText = (text: string) => {
-    if (!synthRef.current || isMuted || mode === 'text') return;
+    if (!synthRef.current || isMuted || modeRef.current === 'text') return;
 
     // Interrupt previous speech
     synthRef.current.cancel();
@@ -141,11 +175,13 @@ export const ReceptionistPage: React.FC<ReceptionistPageProps> = ({ isDemoMode }
     utterance.pitch = 1.0;
 
     utterance.onstart = () => {
+      isSpeakingRef.current = true;
       setVoiceState('speaking');
     };
 
     utterance.onend = () => {
-      if (isVoiceActive) {
+      isSpeakingRef.current = false;
+      if (voiceActiveRef.current) {
         setVoiceState('listening');
       } else {
         setVoiceState('idle');
@@ -153,7 +189,8 @@ export const ReceptionistPage: React.FC<ReceptionistPageProps> = ({ isDemoMode }
     };
 
     utterance.onerror = () => {
-      setVoiceState(isVoiceActive ? 'listening' : 'idle');
+      isSpeakingRef.current = false;
+      setVoiceState(voiceActiveRef.current ? 'listening' : 'idle');
     };
 
     synthRef.current.speak(utterance);
@@ -171,12 +208,23 @@ export const ReceptionistPage: React.FC<ReceptionistPageProps> = ({ isDemoMode }
     if (recognitionRef.current) {
       try {
         recognitionRef.current.start();
-      } catch (_) {}
+      } catch (_) {
+        // Handle restarting an already initialized recognition instance
+        try {
+          recognitionRef.current.stop();
+          setTimeout(() => {
+            if (voiceActiveRef.current) {
+              try { recognitionRef.current?.start(); } catch (_) {}
+            }
+          }, 150);
+        } catch (_) {}
+      }
     }
   };
 
   const endVoiceConversation = () => {
     voiceActiveRef.current = false;
+    isSpeakingRef.current = false;
     setIsVoiceActive(false);
     setVoiceState('idle');
     if (recognitionRef.current) {
@@ -212,18 +260,28 @@ export const ReceptionistPage: React.FC<ReceptionistPageProps> = ({ isDemoMode }
 
   // Core submission handler for both voice transcripts and typed messages
   const handleUserSubmission = async (textToSend: string) => {
-    if (!textToSend.trim() || busyRef.current) return;
+    const cleanText = textToSend.trim();
+    if (!cleanText || busyRef.current) return;
+
+    // Deduplicate rapid repeat of exact same text within 2.5s (prevents double triggers from interim speech recognition events)
+    const now = Date.now();
+    const normalized = cleanText.toLowerCase();
+    if (lastSubmissionRef.current.text === normalized && now - lastSubmissionRef.current.time < 2500) {
+      return;
+    }
+    lastSubmissionRef.current = { text: normalized, time: now };
     busyRef.current = true;
 
     // If currently speaking, stop immediately to allow user interruption
     if (synthRef.current) {
       synthRef.current.cancel();
+      isSpeakingRef.current = false;
     }
 
     const userMessage: ChatMessage = {
       id: 'user-' + Date.now(),
       role: 'user',
-      content: textToSend.trim(),
+      content: cleanText,
       timestamp: new Date().toISOString()
     };
 
@@ -233,10 +291,11 @@ export const ReceptionistPage: React.FC<ReceptionistPageProps> = ({ isDemoMode }
     setVoiceState('processing');
 
     try {
-      const response = await sendChatMessage(textToSend, sessionToken, mode);
+      const response = await sendChatMessage(cleanText, sessionTokenRef.current, modeRef.current);
 
       if (response.session_token) {
         setSessionToken(response.session_token);
+        sessionTokenRef.current = response.session_token;
       }
       if (response.verified_reference) {
         setVerifiedReference(response.verified_reference);
@@ -266,10 +325,10 @@ export const ReceptionistPage: React.FC<ReceptionistPageProps> = ({ isDemoMode }
       setMessages((prev) => [...prev, assistantMessage]);
 
       // Speak response in voice mode
-      if (mode === 'voice' && isVoiceActive && !isMuted) {
+      if (modeRef.current === 'voice' && voiceActiveRef.current && !mutedRef.current) {
         speakText(response.reply);
       } else {
-        setVoiceState(isVoiceActive ? 'listening' : 'idle');
+        setVoiceState(voiceActiveRef.current ? 'listening' : 'idle');
       }
     } catch (err: any) {
       const errorMsg = err.message || 'Something went wrong processing your request.';
@@ -280,7 +339,7 @@ export const ReceptionistPage: React.FC<ReceptionistPageProps> = ({ isDemoMode }
         timestamp: new Date().toISOString()
       };
       setMessages((prev) => [...prev, errorResponse]);
-      setVoiceState('idle');
+      setVoiceState(voiceActiveRef.current ? 'listening' : 'idle');
     } finally {
       busyRef.current = false;
       setIsLoading(false);
