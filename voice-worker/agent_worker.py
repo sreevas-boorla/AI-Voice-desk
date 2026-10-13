@@ -55,12 +55,29 @@ class SensitiveDataFilter(logging.Filter):
         if isinstance(val, str):
             for pattern, repl in self.SENSITIVE_PATTERNS:
                 val = pattern.sub(repl, val)
+            return val
+        s = str(val)
+        sanitized = s
+        for pattern, repl in self.SENSITIVE_PATTERNS:
+            sanitized = pattern.sub(repl, sanitized)
+        if sanitized != s:
+            return sanitized
         return val
 
 
+def setup_sanitized_logging():
+    """Configures root and handler-level filters ensuring child loggers like httpx are sanitized."""
+    filter_instance = SensitiveDataFilter()
+    for h in logging.root.handlers:
+        h.addFilter(filter_instance)
+    for name in ("voicedesk-worker", "httpx", "httpcore"):
+        logging.getLogger(name).addFilter(filter_instance)
+    return filter_instance
+
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+setup_sanitized_logging()
 logger = logging.getLogger("voicedesk-worker")
-logger.addFilter(SensitiveDataFilter())
 
 LIVEKIT_URL = os.getenv("LIVEKIT_URL", "")
 LIVEKIT_API_KEY = os.getenv("LIVEKIT_API_KEY", "")

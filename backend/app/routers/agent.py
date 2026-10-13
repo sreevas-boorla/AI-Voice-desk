@@ -1,7 +1,8 @@
 import uuid
 import json
 from datetime import datetime
-from fastapi import APIRouter, Depends, HTTPException
+from typing import Optional
+from fastapi import APIRouter, Depends, HTTPException, Header
 from sqlalchemy.orm import Session
 from app.database import get_db
 from app.schemas import ChatRequest, ChatResponse, ConfirmActionRequest
@@ -73,15 +74,35 @@ def get_session_history(session_token: str, db: Session = Depends(get_db)):
     }
 
 @router.get("/action-result/{action_id}")
-def get_action_result(action_id: str, session_token: str, db: Session = Depends(get_db)):
+def get_action_result(
+    action_id: str,
+    authorization: Optional[str] = Header(None),
+    db: Session = Depends(get_db)
+):
     """
     Retrieves the authoritative persisted result of a confirmed or rejected action.
     Pure read-only operation: does NOT execute or repeat mutations.
+    Requires Authorization: Bearer <session_token> header. Rejects missing, malformed,
+    or invalid authorization without retaining query-string authentication.
     Enforces session isolation and rejects pending, superseded, or expired actions.
     """
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Missing Authorization header.")
+
+    parts = authorization.strip().split()
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid Authorization header format. Expected 'Bearer <session_token>'."
+        )
+
+    session_token = parts[1]
+    if not session_token:
+        raise HTTPException(status_code=401, detail="Invalid session token.")
+
     session = db.query(ConversationSession).filter(ConversationSession.session_token == session_token).first()
     if not session:
-        raise HTTPException(status_code=404, detail="Session not found.")
+        raise HTTPException(status_code=401, detail="Invalid or expired session token.")
 
     pending = db.query(PendingAction).filter(
         PendingAction.id == action_id

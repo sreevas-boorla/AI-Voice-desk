@@ -42,11 +42,11 @@ class ConfirmationSpeechManager:
         Rejects unknown, cross-session, pending, superseded, or expired actions.
         """
         url = f"{self.backend_api_url}/agent/action-result/{action_id}"
-        params = {"session_token": self.session_token}
+        headers = {"Authorization": f"Bearer {self.session_token}"}
 
         async def _do_req(c: httpx.AsyncClient):
             try:
-                res = await c.get(url, params=params, timeout=10.0)
+                res = await c.get(url, headers=headers, timeout=10.0)
                 if res.status_code == 200:
                     return res.json()
                 logger.warning(

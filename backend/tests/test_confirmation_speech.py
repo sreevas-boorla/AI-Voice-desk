@@ -1,6 +1,8 @@
+import io
 import sys
 import json
 import uuid
+import logging
 import asyncio
 import inspect
 from pathlib import Path
@@ -16,6 +18,7 @@ if str(voice_worker_path) not in sys.path:
     sys.path.insert(0, str(voice_worker_path))
 
 from speech_manager import ConfirmationSpeechManager, play_speech
+from agent_worker import SensitiveDataFilter
 from app.models import ConversationSession, PendingAction
 
 
@@ -138,39 +141,65 @@ def test_backend_action_result_endpoint_enforces_authoritative_rules(client: Tes
     db.add_all([action_book, action_resched, action_rejected, action_pending, action_superseded])
     db.commit()
 
-    # A. Confirmed booking check
-    res = client.get(f"/api/agent/action-result/{action_book.id}?session_token={sess_a.session_token}")
+    auth_headers_a = {"Authorization": f"Bearer {sess_a.session_token}"}
+    auth_headers_b = {"Authorization": f"Bearer {sess_b.session_token}"}
+
+    # A. Confirmed booking check with valid Bearer header
+    res = client.get(f"/api/agent/action-result/{action_book.id}", headers=auth_headers_a)
     assert res.status_code == 200
     assert "CB-9901" in res.json()["message"]
     assert res.json()["status"] == "CONFIRMED"
 
-    # B. Confirmed reschedule check
-    res = client.get(f"/api/agent/action-result/{action_resched.id}?session_token={sess_a.session_token}")
+    # B. Confirmed reschedule check with valid Bearer header
+    res = client.get(f"/api/agent/action-result/{action_resched.id}", headers=auth_headers_a)
     assert res.status_code == 200
     assert "14 October 2026" in res.json()["message"]
 
     # C. Rejected action check
-    res = client.get(f"/api/agent/action-result/{action_rejected.id}?session_token={sess_a.session_token}")
+    res = client.get(f"/api/agent/action-result/{action_rejected.id}", headers=auth_headers_a)
     assert res.status_code == 200
     assert "cancelled" in res.json()["message"].lower()
 
-    # D. Cross-session access check (Session B trying to access Session A action)
-    res = client.get(f"/api/agent/action-result/{action_book.id}?session_token={sess_b.session_token}")
+    # D. Missing Authorization header rejected with 401
+    res = client.get(f"/api/agent/action-result/{action_book.id}")
+    assert res.status_code == 401
+    assert "Missing Authorization" in res.json()["detail"]
+
+    # E. Query-string-only authentication rejected with 401 (not retained as fallback)
+    res = client.get(f"/api/agent/action-result/{action_book.id}?session_token={sess_a.session_token}")
+    assert res.status_code == 401
+    assert "Missing Authorization" in res.json()["detail"]
+
+    # F. Malformed Authorization headers rejected with 401
+    res = client.get(f"/api/agent/action-result/{action_book.id}", headers={"Authorization": f"Basic {sess_a.session_token}"})
+    assert res.status_code == 401
+    assert "Expected 'Bearer" in res.json()["detail"]
+
+    res = client.get(f"/api/agent/action-result/{action_book.id}", headers={"Authorization": "Bearer"})
+    assert res.status_code == 401
+
+    # G. Invalid session token in Bearer header rejected with 401
+    res = client.get(f"/api/agent/action-result/{action_book.id}", headers={"Authorization": "Bearer sess_non_existent"})
+    assert res.status_code == 401
+    assert "Invalid or expired" in res.json()["detail"]
+
+    # H. Cross-session access check (Session B trying to access Session A action) rejected with 403
+    res = client.get(f"/api/agent/action-result/{action_book.id}", headers=auth_headers_b)
     assert res.status_code == 403
     assert "Cross-session" in res.json()["detail"]
 
-    # E. Pending action rejected
-    res = client.get(f"/api/agent/action-result/{action_pending.id}?session_token={sess_a.session_token}")
+    # I. Pending action rejected with 400
+    res = client.get(f"/api/agent/action-result/{action_pending.id}", headers=auth_headers_a)
     assert res.status_code == 400
     assert "still pending" in res.json()["detail"]
 
-    # F. Superseded action rejected
-    res = client.get(f"/api/agent/action-result/{action_superseded.id}?session_token={sess_a.session_token}")
+    # J. Superseded action rejected with 400
+    res = client.get(f"/api/agent/action-result/{action_superseded.id}", headers=auth_headers_a)
     assert res.status_code == 400
     assert "superseded" in res.json()["detail"]
 
-    # G. Unknown action rejected
-    res = client.get(f"/api/agent/action-result/non_existent_action?session_token={sess_a.session_token}")
+    # K. Unknown action rejected with 404
+    res = client.get(f"/api/agent/action-result/non_existent_action", headers=auth_headers_a)
     assert res.status_code == 404
 
 
@@ -432,3 +461,65 @@ def test_confirmation_speech_shutdown_cancels_active_tasks():
         assert "act_long" not in speech_mgr.spoken_actions
 
     asyncio.run(scenario())
+
+
+def test_speech_manager_httpx_auth_header_and_url_sanitization():
+    """
+    Exercises ConfirmationSpeechManager through an HTTPX client with a mock transport:
+    1. Asserts the session token is sent strictly in the Authorization header.
+    2. Asserts the session token is absent from the URL (no query parameters).
+    3. Captures actual HTTPX INFO logs and verifies the synthetic token never appears.
+    """
+    synthetic_token = "sess_synthetic_secret_token_abc999"
+    action_id = "act_test_456"
+    captured_requests = []
+
+    def mock_handler(request: httpx.Request):
+        captured_requests.append(request)
+        return httpx.Response(
+            status_code=200,
+            json={"message": "Your appointment has been confirmed.", "status": "CONFIRMED"}
+        )
+
+    # Capture actual HTTPX logs at INFO level
+    log_stream = io.StringIO()
+    handler = logging.StreamHandler(log_stream)
+    httpx_logger = logging.getLogger("httpx")
+    original_level = httpx_logger.level
+    httpx_logger.setLevel(logging.INFO)
+    httpx_logger.addHandler(handler)
+
+    filter_instance = SensitiveDataFilter()
+    handler.addFilter(filter_instance)
+
+    try:
+        async def scenario():
+            transport = httpx.MockTransport(mock_handler)
+            async with httpx.AsyncClient(transport=transport) as mock_client:
+                speech_mgr = ConfirmationSpeechManager(
+                    session_token=synthetic_token,
+                    correlation_id="corr-mock-test",
+                    backend_api_url="http://testbackend.local/api"
+                )
+                data = await speech_mgr.fetch_authoritative_result(action_id, client=mock_client)
+                assert data is not None
+                assert "confirmed" in data["message"].lower()
+
+        asyncio.run(scenario())
+    finally:
+        handler.flush()
+        httpx_logger.removeHandler(handler)
+        httpx_logger.setLevel(original_level)
+
+    httpx_logs = log_stream.getvalue()
+
+    # 1. Assert captured request headers and URL
+    assert len(captured_requests) == 1
+    req = captured_requests[0]
+    assert req.headers.get("Authorization") == f"Bearer {synthetic_token}"
+    assert synthetic_token not in str(req.url)
+    assert req.url.query == b""
+    assert str(req.url) == f"http://testbackend.local/api/agent/action-result/{action_id}"
+
+    # 2. Assert HTTPX INFO logs do NOT expose the synthetic token
+    assert synthetic_token not in httpx_logs, "Synthetic session token must never appear in HTTPX logs"
