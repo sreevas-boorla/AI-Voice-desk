@@ -10,9 +10,9 @@ VoiceDesk is an agentic AI receptionist built for **CareBridge Clinic**, a ficti
                                       +--------------------------------------------+
                                       |            React + Vite Frontend           |
                                       |         Port 5180 (Proxies /api to 8000)   |
-                                      |  (Tailwind CSS, Web Speech API / LiveKit)  |
+                                      |  (Tailwind CSS, LiveKit WebRTC / Fallback) |
                                       +---------------------+----------------------+
-                                                            | HTTP / WebSocket
+                                                            | HTTP / WebRTC Data Channel
                                                             v
                                       +--------------------------------------------+
                                       |          FastAPI Application Server        |
@@ -36,7 +36,8 @@ VoiceDesk is an agentic AI receptionist built for **CareBridge Clinic**, a ficti
                                       +----------+----------------------+----------+
                                       |         LiveKit Persistent Worker          |
                                       |     (voice-worker/agent_worker.py)         |
-                                      |  - Deepgram STT -> Groq -> Cartesia TTS    |
+                                      |  - Deepgram STT -> Server -> Cartesia TTS  |
+                                      |  - LiveKit Agents SDK 1.8.6+               |
                                       +--------------------------------------------+
 ```
 
@@ -60,8 +61,11 @@ VoiceDesk is an agentic AI receptionist built for **CareBridge Clinic**, a ficti
 5. **IST Timezone & Dynamic Date Resolution**:
    - All schedules and appointments resolve in `Asia/Kolkata` (IST). Phrases like *"tomorrow afternoon"* or *"next Wednesday"* correctly resolve to available 30-minute intervals between 12:00 PM and 5:00 PM based on the dynamic clock.
 6. **Dual Voice Architecture**:
-   - **Browser Web Speech Mode**: Works out of the box in Chromium-based browsers (Chrome, Edge). Features microphone echo prevention (pausing speech detection while assistant speaks), rapid transcript deduplication, mute/unmute, and call restart. *Note: Browser speech recognition depends on your browser vendor's speech engine and is not guaranteed to be local or offline.*
-   - **LiveKit Server Worker (`voice-worker/agent_worker.py`)**: End-to-end real-time audio pipeline using LiveKit Agents, Deepgram STT, Groq LLM tool calling, and Cartesia TTS. Binds each voice room to its own backend conversation session (`room_<session_token>`).
+   - **LiveKit WebRTC Stream**: Official `livekit-client` integration connecting to session-scoped rooms (`room_<session_token>`). Subscribes to agent audio, publishes local microphone audio, and carries transcripts, tool activity, and pending confirmation cards over reliable room data packets.
+   - **Browser Web Speech Mode (Fallback)**: Browser-native speech recognition and synthesis. Includes microphone echo prevention (filtering assistant output from speech recognition), intentional spoken interruption handling, and an explicit "Stop Speaking" button in the toolbar.
+7. **Non-Destructive Seeding**:
+   - Normal seeding (`python -m app.seed` or startup) only generates missing synthetic records on open provider slots. Existing past, rescheduled, or cancelled appointments are never overwritten or revived.
+   - Full baseline restoration is strictly isolated behind the admin-protected `/api/system/reset-demo` endpoint.
 
 ---
 
@@ -79,10 +83,10 @@ cd backend
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 
-# Install dependencies
+# Install dependencies (FastAPI, SQLAlchemy, livekit-api, etc.)
 pip install -r requirements.txt
 
-# Initialize & seed database with dynamic IST dates
+# Initialize & non-destructively seed database with dynamic IST dates
 python -m app.seed
 
 # Start FastAPI backend on port 8000
@@ -96,13 +100,23 @@ Backend API will be accessible at `http://127.0.0.1:8000` with Swagger docs at `
 # Navigate to frontend directory
 cd frontend
 
-# Install npm dependencies
+# Install npm dependencies (including livekit-client)
 npm install
 
 # Start Vite development server on port 5180
 npm run dev -- --host 127.0.0.1
 ```
 Open `http://localhost:5180` in Chrome or Edge.
+
+### Terminal 3 (Optional): LiveKit Agent Worker
+
+If you have configured LiveKit server and provider API keys:
+
+```powershell
+cd voice-worker
+pip install -r requirements.txt
+python agent_worker.py
+```
 
 ---
 
@@ -114,7 +128,7 @@ Create `.env` in the repository root or in `backend/.env` (both are automaticall
 # Database (defaults to local SQLite)
 DATABASE_URL=sqlite:///./voicedesk.db
 
-# Security
+# Security & Admin Access
 SECRET_KEY=replace-with-a-random-secret-key-at-least-32-characters-long
 ADMIN_USERNAME=admin
 ADMIN_PASSWORD=CareBridge2026!
@@ -126,10 +140,12 @@ GROQ_API_KEY=your_groq_api_key_here
 GROQ_MODEL=llama-3.3-70b-versatile
 GROQ_TIMEOUT_SECONDS=30.0
 
-# LiveKit WebRTC Voice Credentials (Optional)
+# LiveKit WebRTC Voice Credentials (Optional - leave empty for Browser Fallback)
 LIVEKIT_URL=wss://your-project.livekit.cloud
 LIVEKIT_API_KEY=your_livekit_api_key
 LIVEKIT_API_SECRET=your_livekit_api_secret
+
+# Speech-to-Text & Text-to-Speech Plugins (Used by agent_worker.py)
 DEEPGRAM_API_KEY=your_deepgram_api_key
 CARTESIA_API_KEY=your_cartesia_api_key
 ```
@@ -142,7 +158,7 @@ When `ENVIRONMENT=production`, the application refuses startup if:
 
 ### Live Credentials Disclosure
 > [!NOTE]
-> In this local development and portfolio evaluation environment, no live external Groq API key or LiveKit server credentials were configured. The system gracefully operates with its deterministic simulator, dynamic database tools, and browser Web Speech API. Live tool calling and error handlers have been validated via unit tests.
+> In this local development and portfolio evaluation environment, no live external Groq API key or LiveKit server credentials were configured. The system gracefully operates with its deterministic simulator, dynamic database tools, and browser Web Speech API. Live tool calling, error handlers, and LiveKit token generation have been validated via automated tests.
 
 ---
 
@@ -171,7 +187,7 @@ For portfolio testing, CareBridge Clinic seeds dynamic appointments relative to 
 ## Running Automated Tests
 
 ### 1. Backend Business & Concurrency Suite (`pytest`)
-Executes 15 tests covering slot booking, unverified access blocking, reschedule confirmation requirement, decline state preservation, concurrent double-booking prevention, idempotent repeated confirmations, atomic reschedule rollbacks, Groq tool-calling loops, superseded pending action invalidation, and production hardening.
+Executes 17 tests covering slot booking, unverified access blocking, reschedule confirmation requirement, decline state preservation, concurrent double-booking prevention, idempotent repeated confirmations, atomic reschedule rollbacks, Groq tool-calling loops, superseded pending action invalidation, production hardening, and non-destructive re-seeding regressions.
 
 ```powershell
 cd backend
@@ -181,7 +197,7 @@ python -m pytest tests -v
 ### 2. End-to-End Browser Flow Suite (`Playwright`)
 Executes browser automation verifying:
 1. `test_browser_flow.py`: Verified lookup (CB-1001) ➔ Reschedule request ➔ Confirmation card ➔ Admin record verification ➔ Responsive layout.
-2. `test_voice_and_booking_flows.py`: Text booking flow ➔ Confirmation persistence ➔ Admin verification ➔ Browser microphone recognition ➔ SpeechSynthesis audio playback ➔ Mute/unmute ➔ End call.
+2. `test_voice_and_booking_flows.py`: Text booking flow ➔ Confirmation persistence ➔ Admin verification ➔ Browser microphone recognition ➔ SpeechSynthesis audio playback ➔ Mute/unmute ➔ End call ➔ Missing LiveKit credentials error flow.
 
 ```powershell
 # Ensure backend (port 8000) and frontend (port 5180) are running
@@ -191,7 +207,18 @@ python tests-e2e/test_voice_and_booking_flows.py
 
 ---
 
-## Docker Status Notice
+## Docker Compose Configurations
 
-Multi-container configuration files are included (`docker-compose.yml`, `Dockerfile.backend`, `Dockerfile.frontend`, `Dockerfile.voice`).
+Two clearly separated Docker Compose configurations are provided:
+
+1. **`docker-compose.yml` (Local Demo & Development)**:
+   - Sets `ENVIRONMENT: development` and `DEMO_MODE: "true"`.
+   - Pre-configures local PostgreSQL, FastAPI backend on port 8000, and Nginx frontend on port 5180.
+   - Command: `docker compose up --build`
+
+2. **`docker-compose.prod.yml` (Production Deployment)**:
+   - Sets `ENVIRONMENT: production` and `DEMO_MODE: "false"`.
+   - Strictly enforces required production secrets via environment variables (`POSTGRES_PASSWORD`, `SECRET_KEY`, `ADMIN_PASSWORD`, `GROQ_API_KEY`).
+   - Command: `docker compose -f docker-compose.prod.yml up --build`
+
 *Note: Docker was not available on the current Windows host environment during testing; local execution and end-to-end verification were conducted directly on Windows PowerShell with Python 3.12 and Node 20.*

@@ -1,0 +1,84 @@
+version: '3.8'
+
+# ============================================================
+# VoiceDesk Production Compose Configuration
+# Strict production hardening:
+# - ENVIRONMENT=production
+# - DEMO_MODE=false
+# - Requires non-default secrets provided via environment variables
+# ============================================================
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: voicedesk-postgres-prod
+    restart: always
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-voicedesk}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?ERROR: POSTGRES_PASSWORD must be set in production}
+      POSTGRES_DB: ${POSTGRES_DB:-voicedesk_db}
+    volumes:
+      - postgres_prod_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U voicedesk -d voicedesk_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: voicedesk-backend-prod
+    restart: always
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-voicedesk}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-voicedesk_db}
+      SECRET_KEY: ${SECRET_KEY:?ERROR: SECRET_KEY must be set to a secure random string in production}
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?ERROR: ADMIN_PASSWORD must be changed from default in production}
+      DEMO_MODE: "false"
+      CLINIC_TIMEZONE: Asia/Kolkata
+      ENVIRONMENT: production
+      LIVEKIT_URL: ${LIVEKIT_URL:-}
+      LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:-}
+      LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:-}
+      GROQ_API_KEY: ${GROQ_API_KEY:?ERROR: GROQ_API_KEY must be configured for live LLM mode}
+      GROQ_MODEL: ${GROQ_MODEL:-llama-3.3-70b-versatile}
+      GROQ_TIMEOUT_SECONDS: ${GROQ_TIMEOUT_SECONDS:-30.0}
+    ports:
+      - "8000:8000"
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    container_name: voicedesk-frontend-prod
+    restart: always
+    depends_on:
+      - backend
+    ports:
+      - "${FRONTEND_PORT:-5180}:80"
+
+  voice-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.voice
+    container_name: voicedesk-voice-worker-prod
+    restart: always
+    depends_on:
+      - backend
+    environment:
+      BACKEND_API_URL: http://backend:8000/api
+      LIVEKIT_URL: ${LIVEKIT_URL:?ERROR: LIVEKIT_URL required for voice worker}
+      LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:?ERROR: LIVEKIT_API_KEY required for voice worker}
+      LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:?ERROR: LIVEKIT_API_SECRET required for voice worker}
+      DEEPGRAM_API_KEY: ${DEEPGRAM_API_KEY:?ERROR: DEEPGRAM_API_KEY required for voice worker}
+      CARTESIA_API_KEY: ${CARTESIA_API_KEY:?ERROR: CARTESIA_API_KEY required for voice worker}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      GROQ_MODEL: ${GROQ_MODEL:-llama-3.3-70b-versatile}
+
+volumes:
+  postgres_prod_data:

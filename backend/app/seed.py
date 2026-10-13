@@ -8,7 +8,7 @@ from app.models import (
 from app.auth import hash_password
 from app.config import settings
 
-def seed_database(db: Session):
+def seed_database(db: Session, force_reset: bool = False):
     # 1. Admin User
     admin = db.query(AdminUser).filter(AdminUser.username == settings.ADMIN_USERNAME).first()
     if not admin:
@@ -127,6 +127,7 @@ def seed_database(db: Session):
     b_start = datetime(block_day.year, block_day.month, block_day.day, 14, 0)
     b_end = datetime(block_day.year, block_day.month, block_day.day, 15, 0)
 
+    # Only seed missing blocked slot if not present
     b_slot = db.query(BlockedSlot).filter(BlockedSlot.provider_id == aisha.id).first()
     if not b_slot:
         db.add(BlockedSlot(
@@ -135,7 +136,7 @@ def seed_database(db: Session):
             end_time=b_end,
             reason="Hospital Clinical Board Meeting"
         ))
-    else:
+    elif force_reset:
         b_slot.start_time = b_start
         b_slot.end_time = b_end
 
@@ -198,23 +199,43 @@ def seed_database(db: Session):
             pt = patients[app["patient_phone"]]
             pr = providers[app["provider_name"]]
             srv = services[app["service_name"]]
+
+            # Verify availability against existing appointments and blocked slots
+            start_cand = app["start"]
+            end_cand = app["end"]
+            while True:
+                conflict_app = db.query(Appointment).filter(
+                    Appointment.provider_id == pr.id,
+                    Appointment.start_time == start_cand,
+                    Appointment.status.in_(["CONFIRMED", "RESCHEDULED"])
+                ).first()
+                conflict_block = db.query(BlockedSlot).filter(
+                    BlockedSlot.provider_id == pr.id,
+                    BlockedSlot.start_time < end_cand,
+                    BlockedSlot.end_time > start_cand
+                ).first()
+                if not conflict_app and not conflict_block:
+                    break
+                # Try next 30 min slot
+                start_cand += timedelta(minutes=30)
+                end_cand += timedelta(minutes=30)
+
             db.add(Appointment(
                 booking_reference=app["reference"],
                 patient_id=pt.id,
                 provider_id=pr.id,
                 service_id=srv.id,
-                start_time=app["start"],
-                end_time=app["end"],
+                start_time=start_cand,
+                end_time=end_cand,
                 status="CONFIRMED",
                 verification_code=app["code"],
                 notes=app["notes"]
             ))
-        else:
-            # Update dates to keep future demo lookups fresh and valid
-            if existing_app.start_time < now_ist.replace(tzinfo=None):
-                existing_app.start_time = app["start"]
-                existing_app.end_time = app["end"]
-                existing_app.status = "CONFIRMED"
+        elif force_reset:
+            # Force reset only when explicitly requested by admin reset operation
+            existing_app.start_time = app["start"]
+            existing_app.end_time = app["end"]
+            existing_app.status = "CONFIRMED"
 
     db.commit()
 

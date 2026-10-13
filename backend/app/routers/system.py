@@ -115,6 +115,6 @@ def reset_demo_data(db: Session = Depends(get_db), admin=Depends(get_current_adm
     # Re-create and seed tables
     Base.metadata.drop_all(bind=engine)
     Base.metadata.create_all(bind=engine)
-    seed_database(db)
+    seed_database(db, force_reset=True)
 
     return {"message": "Demo data successfully reset to synthetic baseline."}

@@ -58,9 +58,30 @@ export async function fetchSystemStatus() {
   return res.json();
 }
 
-export async function fetchVoiceStatus() {
-  const res = await fetch(`${API_BASE}/voice/status`);
-  return res.json();
+export interface VoiceStatusResponse {
+  livekit_configured: boolean;
+  livekit_api_installed: boolean;
+  livekit_ready: boolean;
+  llm_configured: boolean;
+  preferred_engine: 'livekit' | 'browser';
+  message: string;
+}
+
+export async function fetchVoiceStatus(): Promise<VoiceStatusResponse> {
+  try {
+    const res = await fetch(`${API_BASE}/voice/status`);
+    if (!res.ok) throw new Error('Failed to fetch voice status');
+    return await res.json();
+  } catch (_) {
+    return {
+      livekit_configured: false,
+      livekit_api_installed: false,
+      livekit_ready: false,
+      llm_configured: false,
+      preferred_engine: 'browser',
+      message: 'Could not fetch voice engine status from server.'
+    };
+  }
 }
 
 export async function fetchDemoReferences() {

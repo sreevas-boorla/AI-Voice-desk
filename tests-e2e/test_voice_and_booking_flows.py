@@ -55,14 +55,15 @@ def test_text_booking_flow(page):
 
 
 def test_browser_microphone_and_spoken_responses(page):
-    print("\n--- Testing Browser Microphone Input and Spoken Responses ---")
+    print("\n--- Testing Browser Speech Fallback (MOCKED Web Speech API in Headless Browser) ---")
+    print("  [DISCLOSURE: This test exercises frontend speech event hooks, React state transitions,")
+    print("   and audio DOM elements via a synthetic SpeechRecognition / SpeechSynthesis spy.")
+    print("   It does NOT prove physical microphone hardware capture or acoustic loudspeaker playback.]")
 
     # 1. Inject Web Speech API mock/spy so headless Chromium can simulate SpeechRecognition and capture SpeechSynthesis
     page.add_init_script("""
-    // Track speech synthesis utterances
     window.__spokenUtterances = [];
     
-    // Mock webkitSpeechRecognition
     class MockSpeechRecognition {
       constructor() {
         this.continuous = true;
@@ -102,7 +103,6 @@ def test_browser_microphone_and_spoken_responses(page):
     window.SpeechRecognition = MockSpeechRecognition;
 
     // Spy on SpeechSynthesis
-    const origSpeak = window.speechSynthesis ? window.speechSynthesis.speak.bind(window.speechSynthesis) : () => {};
     window.speechSynthesis.speak = function(utterance) {
       window.__spokenUtterances.push(utterance.text);
       if (utterance.onstart) setTimeout(() => utterance.onstart(), 20);
@@ -116,7 +116,13 @@ def test_browser_microphone_and_spoken_responses(page):
     expect(page.locator("text=Receptionist Audio Channel").first).to_be_visible()
     expect(page.locator("text=Ready / Standby").first).to_be_visible()
 
-    # 2. Click Start Voice Call (requests mic and starts recognition)
+    # Ensure Browser Web Speech engine is selected
+    browser_engine_btn = page.locator("button:has-text('Browser Web Speech')")
+    if browser_engine_btn.is_visible():
+        browser_engine_btn.click()
+        print("Explicitly selected Browser Web Speech fallback engine.")
+
+    # 2. Click Start Voice Call
     start_voice_btn = page.locator("button:has-text('Start Voice Call')")
     start_voice_btn.click()
     print("Clicked Start Voice Call.")
@@ -138,7 +144,7 @@ def test_browser_microphone_and_spoken_responses(page):
     print("Assistant response generated in transcript.")
 
     # 5. Verify SpeechSynthesis captured spoken response
-    time.sleep(1) # wait for utterance to dispatch
+    time.sleep(1)
     spoken_texts = page.evaluate("window.__spokenUtterances")
     print(f"Captured {len(spoken_texts)} spoken utterances via SpeechSynthesis:")
     for i, txt in enumerate(spoken_texts):
@@ -164,6 +170,24 @@ def test_browser_microphone_and_spoken_responses(page):
     print("Ended voice call. Audio engine returned to 'Ready / Standby' idle state.")
 
 
+def test_missing_livekit_credentials_flow(page):
+    print("\n--- Testing LiveKit Missing Credentials Error Flow ---")
+    page.goto(FRONTEND_URL, wait_until="domcontentloaded", timeout=30000)
+
+    # Click on LiveKit WebRTC engine
+    livekit_btn = page.locator("button:has-text('LiveKit WebRTC')")
+    livekit_btn.click()
+    print("Selected LiveKit WebRTC engine.")
+
+    # Attempt to start voice call without configured credentials
+    page.locator("button:has-text('Start Voice Call')").click()
+    print("Clicked Start Voice Call on unconfigured LiveKit engine.")
+
+    # Verify actionable error is shown to the user
+    page.wait_for_selector("text=LiveKit streaming credentials not configured", timeout=10000)
+    print("Verified actionable error message rendered for unconfigured LiveKit streaming.")
+
+
 def main():
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -179,8 +203,9 @@ def main():
         try:
             test_text_booking_flow(page)
             test_browser_microphone_and_spoken_responses(page)
+            test_missing_livekit_credentials_flow(page)
             print("\n=======================================================")
-            print("ALL TEXT BOOKING AND BROWSER VOICE TESTS PASSED!")
+            print("ALL TEXT BOOKING, MOCKED VOICE, & LIVEKIT ERROR FLOWS PASSED!")
             print("=======================================================\n")
         finally:
             browser.close()

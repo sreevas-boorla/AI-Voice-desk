@@ -1,5 +1,11 @@
 version: '3.8'
 
+# ============================================================
+# VoiceDesk Local Demo & Development Compose Configuration
+# Port 5180 (Frontend) -> Port 8000 (FastAPI Backend)
+# Runs with DEMO_MODE=true and ENVIRONMENT=development
+# ============================================================
+
 services:
   db:
     image: postgres:16-alpine
@@ -7,7 +13,7 @@ services:
     restart: always
     environment:
       POSTGRES_USER: voicedesk
-      POSTGRES_PASSWORD: voicedesk_secure_password_2026
+      POSTGRES_PASSWORD: voicedesk_dev_password_2026
       POSTGRES_DB: voicedesk_db
     ports:
       - "5432:5432"
@@ -29,13 +35,18 @@ services:
       db:
         condition: service_healthy
     environment:
-      DATABASE_URL: postgresql://voicedesk:voicedesk_secure_password_2026@db:5432/voicedesk_db
+      DATABASE_URL: postgresql://voicedesk:voicedesk_dev_password_2026@db:5432/voicedesk_db
       SECRET_KEY: carebridge-voicedesk-secret-key-2026-secure
       ADMIN_USERNAME: admin
       ADMIN_PASSWORD: CareBridge2026!
       DEMO_MODE: "true"
       CLINIC_TIMEZONE: Asia/Kolkata
-      ENVIRONMENT: production
+      ENVIRONMENT: development
+      LIVEKIT_URL: ${LIVEKIT_URL:-}
+      LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:-}
+      LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:-}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      GROQ_MODEL: ${GROQ_MODEL:-llama-3.3-70b-versatile}
     ports:
       - "8000:8000"
 
@@ -48,7 +59,7 @@ services:
     depends_on:
       - backend
     ports:
-      - "5173:80"
+      - "5180:80"
 
   voice-worker:
     build:
@@ -63,7 +74,10 @@ services:
       LIVEKIT_URL: ${LIVEKIT_URL:-}
       LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:-}
       LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:-}
+      DEEPGRAM_API_KEY: ${DEEPGRAM_API_KEY:-}
+      CARTESIA_API_KEY: ${CARTESIA_API_KEY:-}
       GROQ_API_KEY: ${GROQ_API_KEY:-}
+      GROQ_MODEL: ${GROQ_MODEL:-llama-3.3-70b-versatile}
 
 volumes:
   postgres_data:
