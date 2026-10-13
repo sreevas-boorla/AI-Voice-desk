@@ -122,15 +122,44 @@ def run_worker():
                 allow_interruptions=True
             )
 
+            # Sequential FIFO turn queue to prevent overlapping requests or out-of-order execution
+            turn_queue: asyncio.Queue[str] = asyncio.Queue()
+            last_processed = {"text": "", "time": 0.0}
+
+            async def process_turns_sequentially():
+                while True:
+                    try:
+                        user_text = await turn_queue.get()
+                        await handle_user_turn(session, ctx.room, session_token, user_text)
+                    except asyncio.CancelledError:
+                        break
+                    except Exception as e:
+                        logger.error(f"Error handling turn in session {session_token}: {e}")
+                    finally:
+                        turn_queue.task_done()
+
+            # Start background worker task for sequential turns
+            worker_task = asyncio.create_task(process_turns_sequentially())
+            ctx.add_shutdown_callback(lambda: worker_task.cancel())
+
             @session.on("user_input_transcribed")
             def on_user_speech(event: UserInputTranscribedEvent):
                 if not event.is_final or not event.transcript.strip():
                     return
                 user_text = event.transcript.strip()
-                logger.info(f"User utterance transcribed in session {session_token}: '{user_text}'")
-                asyncio.create_task(handle_user_turn(session, ctx.room, session_token, user_text))
+                now = asyncio.get_event_loop().time()
 
-            session.start(agent, room=ctx.room)
+                # Deduplicate rapid repeat of exact transcript within 2.0s
+                if user_text.lower() == last_processed["text"].lower() and (now - last_processed["time"]) < 2.0:
+                    logger.info(f"Duplicate transcript discarded in session {session_token}: '{user_text}'")
+                    return
+                last_processed["text"] = user_text
+                last_processed["time"] = now
+
+                logger.info(f"User utterance queued in session {session_token}: '{user_text}'")
+                turn_queue.put_nowait(user_text)
+
+            await session.start(agent=agent, room=ctx.room)
             logger.info(f"LiveKit AgentSession active in room {room_name}.")
 
         async def handle_user_turn(session, room, session_token: str, user_text: str):
@@ -157,6 +186,9 @@ def run_worker():
             await session.say(reply_text, allow_interruptions=True)
 
         options = WorkerOptions(entrypoint_fnc=entrypoint)
+        # Default to "start" command if invoked without explicit CLI subcommand
+        if len(sys.argv) == 1:
+            sys.argv.append("start")
         cli.run_app(options)
 
     except ImportError as e:

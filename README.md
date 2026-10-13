@@ -187,7 +187,7 @@ For portfolio testing, CareBridge Clinic seeds dynamic appointments relative to 
 ## Running Automated Tests
 
 ### 1. Backend Business & Concurrency Suite (`pytest`)
-Executes 17 tests covering slot booking, unverified access blocking, reschedule confirmation requirement, decline state preservation, concurrent double-booking prevention, idempotent repeated confirmations, atomic reschedule rollbacks, Groq tool-calling loops, superseded pending action invalidation, production hardening, and non-destructive re-seeding regressions.
+Executes 19 tests covering slot booking, unverified access blocking, reschedule confirmation requirement, decline state preservation, concurrent double-booking prevention, idempotent repeated confirmations, atomic reschedule rollbacks, Groq tool-calling loops, superseded pending action invalidation, production hardening, non-destructive re-seeding regressions, and LiveKit worker sequential turn queue / deduplication processing.
 
 ```powershell
 cd backend
