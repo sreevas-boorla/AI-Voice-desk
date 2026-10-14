@@ -95,8 +95,9 @@ def test_reschedule_requires_confirmation(db: Session):
     app_before = db.query(Appointment).filter(Appointment.booking_reference == ref).first()
     original_start = app_before.start_time
     
-    # Prepare reschedule
-    new_slot_iso = "2026-10-15T11:00:00+05:30"
+    # Prepare reschedule using dynamic future available slot
+    slots = get_available_slots(db, app_before.provider_id, resolve_natural_date("next thursday"))
+    new_slot_iso = slots[0]["start_time"]
     prep = prepare_reschedule(db, sess.id, ref, new_slot_iso)
     action_id = prep["action_id"]
     
@@ -116,8 +117,10 @@ def test_declining_confirmation_leaves_data_unchanged(db: Session):
     orig_start = app_before.start_time
     orig_status = app_before.status
     
-    # Prepare reschedule
-    prep = prepare_reschedule(db, sess.id, ref, "2026-10-16T12:00:00+05:30")
+    # Prepare reschedule using dynamic future slot
+    slots = get_available_slots(db, app_before.provider_id, resolve_natural_date("next friday"))
+    new_slot_iso = slots[0]["start_time"]
+    prep = prepare_reschedule(db, sess.id, ref, new_slot_iso)
     
     # Decline
     res = confirm_pending_action(db, sess.id, prep["action_id"], confirmed=False)

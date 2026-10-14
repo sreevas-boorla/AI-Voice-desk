@@ -47,6 +47,7 @@ def test_receptionist_verified_reschedule_and_admin_flow():
 
         # Check if login is needed
         if page.locator("input[type='password']").is_visible():
+            page.locator("form input[type='text']").fill("admin")
             page.locator("input[type='password']").fill("CareBridge2026!")
             page.locator("button:has-text('Sign In to Dashboard')").click()
 

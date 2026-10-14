@@ -11,4 +11,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY voice-worker/ .
 
-CMD ["python", "agent_worker.py"]
+CMD ["python", "agent_worker.py", "start"]
